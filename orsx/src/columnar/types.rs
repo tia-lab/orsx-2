@@ -3,6 +3,8 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::TryStreamExt;
 use sqlx::postgres::PgConnection;
+// NOTE: We intentionally use a single contiguous buffer for COPY BINARY parsing to
+// minimize per-field overhead on wide tables.
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ColumnarType {
@@ -50,14 +52,23 @@ impl ColumnarSchema {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ColumnarReadConfig {
     pub validate_utf8: bool,
+    pub var_inline_limit: usize,
+}
+
+impl Default for ColumnarReadConfig {
+    fn default() -> Self {
+        Self {
+            validate_utf8: false,
+            var_inline_limit: 64 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct CopyBinaryBatchReaderConfig {
-    pub compact_after_bytes: usize,
     pub max_header_extension_bytes: usize,
     pub max_field_bytes: usize,
 }
@@ -65,7 +76,6 @@ pub struct CopyBinaryBatchReaderConfig {
 impl Default for CopyBinaryBatchReaderConfig {
     fn default() -> Self {
         Self {
-            compact_after_bytes: 64 * 1024,
             max_header_extension_bytes: 1024 * 1024,
             max_field_bytes: 256 * 1024 * 1024,
         }
@@ -151,6 +161,8 @@ pub(crate) enum ColumnData {
         validity: ValidityBitmap,
         offsets: Vec<u32>,
         data: Vec<u8>,
+        chunks: Vec<Bytes>,
+        total_len: u32,
     },
 }
 
@@ -162,6 +174,8 @@ impl ColumnData {
                 validity: ValidityBitmap::new(),
                 offsets: vec![0],
                 data: Vec::new(),
+                chunks: Vec::new(),
+                total_len: 0,
             }),
             ColumnarType::Bool => Ok(ColumnData::FixedBool {
                 validity: ValidityBitmap::new(),
@@ -258,6 +272,8 @@ impl ColumnData {
                 validity,
                 offsets,
                 data,
+                chunks,
+                total_len,
                 ..
             } => {
                 validity.prepare(row_capacity)?;
@@ -269,6 +285,8 @@ impl ColumnData {
                         .ok_or_else(|| Error::Other("var column capacity overflow".to_string()))?,
                 );
                 data.clear();
+                chunks.clear();
+                *total_len = 0;
             }
         }
         Ok(())
@@ -318,7 +336,27 @@ impl ColumnData {
 
     fn var_slices(&self) -> Option<(&[u32], &[u8])> {
         match self {
-            ColumnData::Var { offsets, data, .. } => Some((offsets.as_slice(), data.as_slice())),
+            // Var columns are chunked; use `var_chunks` and coalesce if required.
+            ColumnData::Var { .. } => None,
+            _ => None,
+        }
+    }
+
+    fn var_chunks(&self) -> Option<(&[u32], &[Bytes], u32)> {
+        match self {
+            ColumnData::Var {
+                offsets,
+                chunks,
+                total_len,
+                ..
+            } => Some((offsets.as_slice(), chunks.as_slice(), *total_len)),
+            _ => None,
+        }
+    }
+
+    fn var_inline_bytes(&self) -> Option<&[u8]> {
+        match self {
+            ColumnData::Var { data, .. } => Some(data.as_slice()),
             _ => None,
         }
     }
@@ -445,6 +483,40 @@ impl ColumnarBatch {
         self.columns.get(idx).and_then(|c| c.var_slices())
     }
 
+    pub fn var_chunks(&self, idx: usize) -> Option<(&[u32], &[Bytes], u32)> {
+        self.columns.get(idx).and_then(|c| c.var_chunks())
+    }
+
+    pub fn coalesce_var_into(&self, idx: usize, out: &mut Vec<u8>) -> Result<()> {
+        let Some((offsets, chunks, total_len)) = self.var_chunks(idx) else {
+            return Err(Error::Other("expected varlen column".to_string()));
+        };
+        let total_usize: usize = total_len
+            .try_into()
+            .map_err(|_| Error::Other("var column too large".to_string()))?;
+        out.clear();
+        out.reserve(total_usize);
+        if let Some(inline) = self.columns.get(idx).and_then(|c| c.var_inline_bytes()) {
+            out.extend_from_slice(inline);
+        }
+        for c in chunks {
+            out.extend_from_slice(c.as_ref());
+        }
+        if out.len() != total_usize {
+            return Err(Error::Other("var coalesce length mismatch".to_string()));
+        }
+        // Basic sanity: offsets last matches total.
+        let last = *offsets.last().unwrap_or(&0);
+        if last != total_len {
+            return Err(Error::Other("var coalesce offsets mismatch".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn var_inline_bytes(&self, idx: usize) -> Option<&[u8]> {
+        self.columns.get(idx).and_then(|c| c.var_inline_bytes())
+    }
+
     pub fn prepare(&mut self, row_capacity: usize) -> Result<()> {
         if row_capacity == 0 {
             return Err(Error::Other(
@@ -483,12 +555,10 @@ impl ColumnarBatch {
             ColumnData::FixedF64Bits { values, .. } => values.push(0),
             ColumnData::FixedUuid { values, .. } => values.push([0u8; 16]),
             ColumnData::FixedTimestampMicros { values, .. } => values.push(0),
-            ColumnData::Var { offsets, data, .. } => {
-                let len_u32: u32 = data
-                    .len()
-                    .try_into()
-                    .map_err(|_| Error::Other("var column too large".to_string()))?;
-                offsets.push(len_u32);
+            ColumnData::Var {
+                offsets, total_len, ..
+            } => {
+                offsets.push(*total_len);
             }
         }
         Ok(())
@@ -606,13 +676,33 @@ impl ColumnarBatch {
 
         col.set_validity(row_idx, true)?;
         match col {
-            ColumnData::Var { data, offsets, .. } => {
-                data.extend_from_slice(bytes);
-                let len_u32: u32 = data
+            ColumnData::Var {
+                data,
+                chunks,
+                offsets,
+                total_len,
+                ..
+            } => {
+                let add: u32 = bytes
                     .len()
                     .try_into()
-                    .map_err(|_| Error::Other("var column too large".to_string()))?;
-                offsets.push(len_u32);
+                    .map_err(|_| Error::Other("var chunk too large".to_string()))?;
+                let new_total = total_len
+                    .checked_add(add)
+                    .ok_or_else(|| Error::Other("var column too large".to_string()))?;
+                // Inline small varlen payloads to avoid `Bytes` churn for tiny strings/bytea.
+                const INLINE_LIMIT: u32 = 64 * 1024;
+                if chunks.is_empty() && new_total <= INLINE_LIMIT {
+                    data.extend_from_slice(bytes);
+                } else {
+                    if chunks.is_empty() && !data.is_empty() {
+                        chunks.push(Bytes::copy_from_slice(data.as_slice()));
+                        data.clear();
+                    }
+                    chunks.push(Bytes::copy_from_slice(bytes));
+                }
+                *total_len = new_total;
+                offsets.push(new_total);
             }
             _ => return Err(Error::Other("expected varlen column".to_string())),
         }
@@ -737,11 +827,11 @@ impl<'c> CopyBinaryBatchReader<'c> {
 
     async fn parse_header(&mut self) -> Result<()> {
         const SIG: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
-        let sig = self.read_slice(11).await?;
-        if sig != SIG {
+        let mut sig = [0u8; 11];
+        self.read_exact_into(&mut sig).await?;
+        if sig.as_slice() != SIG {
             return Err(Error::Other("invalid COPY BINARY signature".to_string()));
         }
-        self.maybe_compact();
         let flags = self.read_i32_be().await?;
         if flags != 0 {
             return Err(Error::Other(format!(
@@ -759,10 +849,23 @@ impl<'c> CopyBinaryBatchReader<'c> {
             return Err(Error::Other("COPY header extension too large".to_string()));
         }
         if ext_len_usize > 0 {
-            let _ = self.read_slice(ext_len_usize).await?;
-            self.maybe_compact();
+            self.discard(ext_len_usize).await?;
         }
         Ok(())
+    }
+
+    async fn read_u8(&mut self) -> Result<u8> {
+        self.ensure_available(1).await?;
+        let b = self
+            .buf
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        self.pos = self
+            .pos
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        Ok(b)
     }
 
     async fn read_field_into(
@@ -793,12 +896,10 @@ impl<'c> CopyBinaryBatchReader<'c> {
                 ColumnData::FixedF64Bits { values, .. } => values.push(0),
                 ColumnData::FixedUuid { values, .. } => values.push([0u8; 16]),
                 ColumnData::FixedTimestampMicros { values, .. } => values.push(0),
-                ColumnData::Var { offsets, data, .. } => {
-                    let len_u32: u32 = data
-                        .len()
-                        .try_into()
-                        .map_err(|_| Error::Other("var column too large".to_string()))?;
-                    offsets.push(len_u32);
+                ColumnData::Var {
+                    offsets, total_len, ..
+                } => {
+                    offsets.push(*total_len);
                 }
             }
             return Ok(());
@@ -817,63 +918,46 @@ impl<'c> CopyBinaryBatchReader<'c> {
                 if len_usize != 1 {
                     return Err(Error::Other("COPY field length mismatch for Bool".to_string()));
                 }
-                let bytes = self.read_slice(1).await?;
-                values.push(bytes[0]);
-                self.maybe_compact();
+                let b = self.read_u8().await?;
+                values.push(b);
             }
             ColumnData::FixedI16 { values, .. } => {
                 if len_usize != 2 {
                     return Err(Error::Other("COPY field length mismatch for I16".to_string()));
                 }
-                let b = self.read_slice(2).await?;
-                values.push(i16::from_be_bytes([b[0], b[1]]));
-                self.maybe_compact();
+                values.push(self.read_i16_be().await?);
             }
             ColumnData::FixedI32 { values, .. } => {
                 if len_usize != 4 {
                     return Err(Error::Other("COPY field length mismatch for I32".to_string()));
                 }
-                let b = self.read_slice(4).await?;
-                values.push(i32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-                self.maybe_compact();
+                values.push(self.read_i32_be().await?);
             }
             ColumnData::FixedI64 { values, .. } => {
                 if len_usize != 8 {
                     return Err(Error::Other("COPY field length mismatch for I64".to_string()));
                 }
-                let b = self.read_slice(8).await?;
-                values.push(i64::from_be_bytes([
-                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                ]));
-                self.maybe_compact();
+                values.push(self.read_i64_be().await?);
             }
             ColumnData::FixedF32Bits { values, .. } => {
                 if len_usize != 4 {
                     return Err(Error::Other("COPY field length mismatch for F32".to_string()));
                 }
-                let b = self.read_slice(4).await?;
-                values.push(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-                self.maybe_compact();
+                values.push(self.read_u32_be().await?);
             }
             ColumnData::FixedF64Bits { values, .. } => {
                 if len_usize != 8 {
                     return Err(Error::Other("COPY field length mismatch for F64".to_string()));
                 }
-                let b = self.read_slice(8).await?;
-                values.push(u64::from_be_bytes([
-                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                ]));
-                self.maybe_compact();
+                values.push(self.read_u64_be().await?);
             }
             ColumnData::FixedUuid { values, .. } => {
                 if len_usize != 16 {
                     return Err(Error::Other("COPY field length mismatch for UUID".to_string()));
                 }
-                let b = self.read_slice(16).await?;
                 let mut v = [0u8; 16];
-                v.copy_from_slice(b);
+                self.read_exact_into(&mut v).await?;
                 values.push(v);
-                self.maybe_compact();
             }
             ColumnData::FixedTimestampMicros { values, .. } => {
                 if len_usize != 8 {
@@ -881,8 +965,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         "COPY field length mismatch for TimestampTz".to_string(),
                     ));
                 }
-                let b = self.read_slice(8).await?;
-                let pg_micros = i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                let pg_micros = self.read_i64_be().await?;
                 if pg_micros == i64::MIN || pg_micros == i64::MAX {
                     return Err(Error::Other(
                         "timestamptz infinity is not supported".to_string(),
@@ -893,31 +976,45 @@ impl<'c> CopyBinaryBatchReader<'c> {
                     .checked_add(UNIX_TO_PG_EPOCH_MICROS)
                     .ok_or_else(|| Error::Other("timestamp overflow".to_string()))?;
                 values.push(unix_micros);
-                self.maybe_compact();
             }
-            ColumnData::Var { ty, data, .. } => {
+            ColumnData::Var {
+                ty,
+                data,
+                offsets,
+                total_len,
+                ..
+            } => {
                 let validate_utf8 = self.read_cfg.validate_utf8;
-                let bytes = self.read_slice(len_usize).await?;
+                self.ensure_available(len_usize).await?;
+                let start = self.pos;
+                let end = start
+                    .checked_add(len_usize)
+                    .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+                let bytes = self
+                    .buf
+                    .get(start..end)
+                    .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+                self.pos = end;
                 match ty {
                     ColumnarType::Utf8 => {
                         if validate_utf8 && std::str::from_utf8(bytes).is_err() {
                             return Err(Error::Other("invalid UTF-8 in TEXT column".to_string()));
                         }
-                        data.extend_from_slice(bytes);
                     }
                     ColumnarType::Bytes => {
-                        data.extend_from_slice(bytes);
                     }
                     _ => return Err(Error::Other("internal type mismatch".to_string())),
                 }
-                let len_u32: u32 = data
+                let add: u32 = bytes
                     .len()
                     .try_into()
-                    .map_err(|_| Error::Other("var column too large".to_string()))?;
-                if let ColumnData::Var { offsets, .. } = col {
-                    offsets.push(len_u32);
-                }
-                self.maybe_compact();
+                    .map_err(|_| Error::Other("var chunk too large".to_string()))?;
+                let new_total = total_len
+                    .checked_add(add)
+                    .ok_or_else(|| Error::Other("var column too large".to_string()))?;
+                data.extend_from_slice(bytes);
+                *total_len = new_total;
+                offsets.push(new_total);
             }
         }
 
@@ -925,62 +1022,143 @@ impl<'c> CopyBinaryBatchReader<'c> {
     }
 
     async fn ensure_available(&mut self, needed: usize) -> Result<()> {
+        if needed == 0 {
+            return Ok(());
+        }
+
+        self.compact_if_needed();
+
         while self.buf.len().saturating_sub(self.pos) < needed {
             match self.copy_out.try_next().await {
-                Ok(Some(chunk)) => self.buf.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => self.buf.extend_from_slice(chunk.as_ref()),
                 Ok(None) => break,
                 Err(e) => return Err(Error::Database(e)),
             }
         }
+
         if self.buf.len().saturating_sub(self.pos) < needed {
             return Err(Error::Other("unexpected end of COPY stream".to_string()));
         }
+
         Ok(())
     }
 
-    fn maybe_compact(&mut self) {
-        if self.pos < self.cfg.compact_after_bytes {
-            return;
+    async fn discard(&mut self, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
         }
-        let remaining = self.buf.len().saturating_sub(self.pos);
-        if remaining == 0 {
-            self.buf.clear();
-            self.pos = 0;
-            return;
-        }
-        // Avoid repeatedly moving large tails; compact only when the remaining tail is small.
-        if remaining <= self.cfg.compact_after_bytes {
-            self.buf.copy_within(self.pos.., 0);
-            self.buf.truncate(remaining);
-            self.pos = 0;
-        }
+        self.ensure_available(n).await?;
+        self.pos = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        Ok(())
     }
 
-    async fn read_slice(&mut self, n: usize) -> Result<&[u8]> {
+    async fn read_i16_be(&mut self) -> Result<i16> {
+        self.ensure_available(2).await?;
+        let start = self.pos;
+        let end = start
+            .checked_add(2)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        let s = self
+            .buf
+            .get(start..end)
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        self.pos = end;
+        Ok(i16::from_be_bytes([s[0], s[1]]))
+    }
+
+    async fn read_i32_be(&mut self) -> Result<i32> {
+        self.ensure_available(4).await?;
+        let start = self.pos;
+        let end = start
+            .checked_add(4)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        let s = self
+            .buf
+            .get(start..end)
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        self.pos = end;
+        Ok(i32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    async fn read_i64_be(&mut self) -> Result<i64> {
+        self.ensure_available(8).await?;
+        let start = self.pos;
+        let end = start
+            .checked_add(8)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        let s = self
+            .buf
+            .get(start..end)
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        self.pos = end;
+        Ok(i64::from_be_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    async fn read_u32_be(&mut self) -> Result<u32> {
+        self.ensure_available(4).await?;
+        let start = self.pos;
+        let end = start
+            .checked_add(4)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        let s = self
+            .buf
+            .get(start..end)
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        self.pos = end;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    async fn read_u64_be(&mut self) -> Result<u64> {
+        self.ensure_available(8).await?;
+        let start = self.pos;
+        let end = start
+            .checked_add(8)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        let s = self
+            .buf
+            .get(start..end)
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        self.pos = end;
+        Ok(u64::from_be_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    async fn read_exact_into(&mut self, out: &mut [u8]) -> Result<()> {
+        let n = out.len();
         if n == 0 {
-            return Ok(&[]);
+            return Ok(());
         }
         self.ensure_available(n).await?;
         let start = self.pos;
         let end = start
             .checked_add(n)
             .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-        let slice = &self.buf[start..end];
+        let s = self
+            .buf
+            .get(start..end)
+            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
+        out.copy_from_slice(s);
         self.pos = end;
-        Ok(slice)
+        Ok(())
     }
 
-    async fn read_i16_be(&mut self) -> Result<i16> {
-        let b = self.read_slice(2).await?;
-        let arr = [b[0], b[1]];
-        self.maybe_compact();
-        Ok(i16::from_be_bytes(arr))
-    }
-
-    async fn read_i32_be(&mut self) -> Result<i32> {
-        let b = self.read_slice(4).await?;
-        let arr = [b[0], b[1], b[2], b[3]];
-        self.maybe_compact();
-        Ok(i32::from_be_bytes(arr))
+    fn compact_if_needed(&mut self) {
+        if self.pos == 0 {
+            return;
+        }
+        const MIN_COMPACT: usize = 1024 * 1024;
+        if self.pos < MIN_COMPACT && self.pos * 2 < self.buf.len() {
+            return;
+        }
+        let remaining = self.buf.len().saturating_sub(self.pos);
+        self.buf.copy_within(self.pos.., 0);
+        self.buf.truncate(remaining);
+        self.pos = 0;
     }
 }

@@ -107,7 +107,10 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     )
     .await
     .unwrap()
-    .with_read_config(ColumnarReadConfig { validate_utf8: true });
+    .with_read_config(ColumnarReadConfig {
+        validate_utf8: true,
+        var_inline_limit: 64 * 1024,
+    });
 
     let mut batch = ColumnarBatch::new(schema, 16).unwrap();
     let rows = reader.next_batch_into(&mut batch).await.unwrap();
@@ -211,7 +214,9 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // utf8
     {
         let validity = batch.column_validity_bytes(6).unwrap();
-        let (offsets, data) = batch.var_slices(6).unwrap();
+        let offsets = batch.var_chunks(6).unwrap().0;
+        let mut data = Vec::new();
+        batch.coalesce_var_into(6, &mut data).unwrap();
         for (row, (_, _, _, _, _, _, t, ..)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, t.is_some());
@@ -229,7 +234,9 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // bytes
     {
         let validity = batch.column_validity_bytes(7).unwrap();
-        let (offsets, data) = batch.var_slices(7).unwrap();
+        let offsets = batch.var_chunks(7).unwrap().0;
+        let mut data = Vec::new();
+        batch.coalesce_var_into(7, &mut data).unwrap();
         for (row, (_, _, _, _, _, _, _, by)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, by.is_some());

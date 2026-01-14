@@ -40,6 +40,7 @@ The columnar system provides:
 
 - **Fast path (required)**: Postgres `COPY (SELECT ...) TO STDOUT (FORMAT BINARY)` and parse the binary stream into column buffers.
   - Goal: minimize per-value overhead and allocations.
+  - Implementation note (v1): prefer a contiguous read buffer (`Vec<u8>` + cursor) for parsing; chunk-walking is allowed only if evidence shows a win for the target workloads.
   - Contract: the query must be syntactically wrapped into COPY; caller is responsible for stable column order.
 - **Fallback path (allowed)**: row-wise decode (`sqlx::Row`) into columns.
   - Contract: correctness-first; used for portability/debugging; not the performance target.
@@ -240,4 +241,3 @@ Potential follow-ups (only if evidence shows benefit):
 2. Optional compression of per-column payloads for transport (opt-in).
 3. Parallel decode of fixed-width columns (opt-in; determinism policy required).
 4. Arrow IPC export (compat layer) as a separate, optional module/feature.
-

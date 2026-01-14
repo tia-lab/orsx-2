@@ -1,4 +1,5 @@
 use crate::{Error, Result};
+use bytes::Bytes;
 
 use super::types::{ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, ColumnData};
 
@@ -258,7 +259,13 @@ pub fn encode_orsxcol_v1_into(batch: &ColumnarBatch, out: &mut Vec<u8>) -> Resul
                 }
                 write_u32_le(out, 0);
             }
-            ColumnData::Var { offsets, data, .. } => {
+            ColumnData::Var {
+                offsets,
+                data,
+                chunks,
+                total_len,
+                ..
+            } => {
                 let mut offsets_bytes = Vec::new();
                 offsets_bytes.reserve(
                     offsets
@@ -270,7 +277,37 @@ pub fn encode_orsxcol_v1_into(batch: &ColumnarBatch, out: &mut Vec<u8>) -> Resul
                     offsets_bytes.extend_from_slice(&o.to_le_bytes());
                 }
                 write_bytes_len_u32(out, &offsets_bytes)?;
-                write_bytes_len_u32(out, data)?;
+                let expected_total = *offsets.last().unwrap_or(&0);
+                if expected_total != *total_len {
+                    return Err(Error::Other("var offsets/total_len mismatch".to_string()));
+                }
+                let total_usize: usize = (*total_len)
+                    .try_into()
+                    .map_err(|_| Error::Other("var column too large".to_string()))?;
+                let data_len = data.len();
+                let chunks_len: usize = chunks.iter().map(|c| c.len()).sum();
+                if data_len
+                    .checked_add(chunks_len)
+                    .ok_or_else(|| Error::Other("var payload length overflow".to_string()))?
+                    != total_usize
+                {
+                    return Err(Error::Other("var payload length mismatch".to_string()));
+                }
+                write_u32_le(
+                    out,
+                    total_usize
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                let payload_start = out.len();
+                out.reserve(total_usize);
+                out.extend_from_slice(data.as_slice());
+                for c in chunks {
+                    out.extend_from_slice(c.as_ref());
+                }
+                if out.len().saturating_sub(payload_start) != total_usize {
+                    return Err(Error::Other("var payload length mismatch".to_string()));
+                }
             }
         }
     }
@@ -396,13 +433,18 @@ pub fn decode_orsxcol_v1(bytes: &[u8]) -> Result<ColumnarBatch> {
                 if let ColumnData::Var {
                     validity: v,
                     offsets: o,
-                    data: d,
+                    data,
+                    chunks,
+                    total_len,
                     ..
                 } = &mut col
                 {
                     v.bytes = validity;
                     *o = offsets;
-                    *d = payload2;
+                    *total_len = data_len_u32;
+                    data.clear();
+                    chunks.clear();
+                    chunks.push(Bytes::copy_from_slice(&payload2));
                 }
                 columns.push(col);
             }
@@ -582,10 +624,6 @@ pub fn decode_orsxcol_v1_into(bytes: &[u8], out: &mut ColumnarBatch) -> Result<(
 mod tests {
     use super::*;
 
-    fn le_i64(v: i64) -> Vec<u8> {
-        v.to_le_bytes().to_vec()
-    }
-
     #[test]
     fn orscol_roundtrip_mixed_types_with_nulls() {
         let row_count = 3usize;
@@ -621,15 +659,18 @@ mod tests {
         if let ColumnData::Var {
             validity,
             offsets,
-            data,
+            chunks,
+            total_len,
             ..
         } = &mut c1
         {
             validity.bytes = vec![0b0000_0111]; // all valid
             offsets.clear();
             offsets.extend_from_slice(&[0, 1, 3, 3]);
-            data.extend_from_slice(b"x");
-            data.extend_from_slice(b"yz");
+            chunks.clear();
+            chunks.push(Bytes::copy_from_slice(b"x"));
+            chunks.push(Bytes::copy_from_slice(b"yz"));
+            *total_len = 3;
         } else {
             panic!("expected var");
         }
@@ -637,14 +678,17 @@ mod tests {
         if let ColumnData::Var {
             validity,
             offsets,
-            data,
+            chunks,
+            total_len,
             ..
         } = &mut c2
         {
             validity.bytes = vec![0b0000_0010]; // only row 1 valid
             offsets.clear();
             offsets.extend_from_slice(&[0, 0, 2, 2]);
-            data.extend_from_slice(&[0xAA, 0xBB]);
+            chunks.clear();
+            chunks.push(Bytes::copy_from_slice(&[0xAA, 0xBB]));
+            *total_len = 2;
         } else {
             panic!("expected var");
         }
@@ -684,18 +728,29 @@ mod tests {
                         validity: v_a,
                         offsets: o_a,
                         data: d_a,
+                        chunks: c_a,
+                        total_len: t_a,
                     },
                     ColumnData::Var {
                         ty: ty_b,
                         validity: v_b,
                         offsets: o_b,
                         data: d_b,
+                        chunks: c_b,
+                        total_len: t_b,
                     },
                 ) => {
                     assert_eq!(ty_a, ty_b);
                     assert_eq!(v_a.bytes, v_b.bytes);
                     assert_eq!(o_a, o_b);
-                    assert_eq!(d_a, d_b);
+                    assert_eq!(t_a, t_b);
+                    let mut a_bytes: Vec<u8> = Vec::new();
+                    a_bytes.extend_from_slice(d_a.as_slice());
+                    a_bytes.extend(c_a.iter().flat_map(|x| x.as_ref().iter().copied()));
+                    let mut b_bytes: Vec<u8> = Vec::new();
+                    b_bytes.extend_from_slice(d_b.as_slice());
+                    b_bytes.extend(c_b.iter().flat_map(|x| x.as_ref().iter().copied()));
+                    assert_eq!(a_bytes, b_bytes);
                 }
                 _ => panic!("type mismatch"),
             }
@@ -704,7 +759,7 @@ mod tests {
 
     #[test]
     fn orscol_rejects_bad_offsets() {
-        let row_count = 2usize;
+        let row_count = 3usize;
         let schema = ColumnarSchema::new(vec![ColumnarField {
             name: None,
             ty: ColumnarType::Utf8,
@@ -715,14 +770,18 @@ mod tests {
         if let ColumnData::Var {
             validity,
             offsets,
-            data,
+            chunks,
+            total_len,
             ..
         } = &mut c0
         {
-            validity.bytes = vec![0b0000_0011];
+            validity.bytes = vec![0b0000_0111];
             offsets.clear();
-            offsets.extend_from_slice(&[0, 5, 4]); // decreasing
-            data.extend_from_slice(b"hello");
+            // Decreasing offsets (2 -> 1) but final offset matches total_len.
+            offsets.extend_from_slice(&[0, 2, 1, 2]);
+            chunks.clear();
+            chunks.push(Bytes::copy_from_slice(b"ab"));
+            *total_len = 2;
         } else {
             panic!("expected var");
         }

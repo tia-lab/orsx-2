@@ -127,7 +127,7 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
         {
             let col_idx = fcols + 1;
             let validity = batch.column_validity_bytes(col_idx).unwrap();
-            let (offsets, _data) = batch.var_slices(col_idx).unwrap();
+            let (offsets, _chunks, _total) = batch.var_chunks(col_idx).unwrap();
             for row in 0..rows {
                 if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
                     continue;
@@ -141,15 +141,9 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
         // by
         {
             let col_idx = fcols + 2;
-            let validity = batch.column_validity_bytes(col_idx).unwrap();
-            let (offsets, data) = batch.var_slices(col_idx).unwrap();
-            for row in 0..rows {
-                if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
-                    continue;
-                }
-                let start = offsets[row] as usize;
-                let end = offsets[row + 1] as usize;
-                for &x in &data[start..end] {
+            let (_offsets, chunks, _total) = batch.var_chunks(col_idx).unwrap();
+            for c in chunks {
+                for &x in c.as_ref() {
                     col_sum_bytes = col_sum_bytes.wrapping_add(x as u64);
                 }
             }

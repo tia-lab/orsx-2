@@ -167,3 +167,34 @@ Results:
 Notes:
 - Checksums match between both paths (correctness).
 - Wide-table COPY advantage persists; narrow-table remains close.
+
+### 2026-01-14 14:40:38Z — Revert to contiguous COPY buffer (release)
+
+Change:
+- Reverted COPY BINARY parser from a `VecDeque<Bytes>` chunk-walk to a single contiguous `Vec<u8>` buffer + cursor.
+- Varlen fields are now always copied into the batch varlen `data` buffer during COPY decode (chunk-retention is deferred until it proves beneficial).
+
+Command:
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+
+Results:
+- 100k × 50 cols:
+  - COPY → `ColumnarBatch`: `262.405752ms`
+  - Row-wise → `ColumnarBatch`: `299.598514ms`
+- 100k × 500 cols:
+  - COPY → `ColumnarBatch`: `2.430023982s`
+  - Row-wise → `ColumnarBatch`: `2.892875905s`
+
+### 2026-01-14 14:41:55Z — 1M rows × 50 cols (release)
+
+Command:
+- `ORSX_COL_ROWS=1000000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+
+Results:
+- 1M × 50 cols:
+  - COPY → `ColumnarBatch`: `2.75208442s`
+  - Row-wise → `ColumnarBatch`: `2.528227132s`
+
+Notes:
+- On this workload (narrower but much larger row count), COPY is slightly slower than row-wise; wide-table workloads still strongly favor COPY.
