@@ -73,6 +73,65 @@ pub fn derive_orsx_migrate(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+#[proc_macro_derive(OrsxColumnar, attributes(orsx_table, orsx_column))]
+pub fn derive_orsx_columnar(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let mut fields_ts = Vec::new();
+    let mut idx_consts = Vec::new();
+
+    if let Data::Struct(s) = &input.data {
+        if let Fields::Named(fields) = &s.fields {
+            for (idx, field) in fields.named.iter().enumerate() {
+                let ident = field.ident.as_ref().expect("named field");
+                let field_name = ident.to_string();
+
+                let (_, inner_ty) = unwrap_option(&field.ty);
+                let columnar_type = match rust_type_to_columnar_type(&inner_ty) {
+                    Ok(ts) => ts,
+                    Err(err) => return TokenStream::from(err.to_compile_error()),
+                };
+
+                let const_ident = syn::Ident::new(
+                    &format!("COL_{}", field_name.to_uppercase()),
+                    ident.span(),
+                );
+                let idx_lit = idx;
+
+                idx_consts.push(quote! {
+                    pub const #const_ident: usize = #idx_lit;
+                });
+
+                fields_ts.push(quote! {
+                    orsx::columnar::ColumnarField {
+                        name: Some(#field_name.to_string()),
+                        ty: #columnar_type,
+                    }
+                });
+            }
+        }
+    }
+
+    let expanded = quote! {
+        impl #impl_generics orsx::columnar::OrsxColumnar for #name #ty_generics #where_clause {
+            fn columnar_schema() -> orsx::Result<orsx::columnar::ColumnarSchema> {
+                orsx::columnar::ColumnarSchema::new(vec![
+                    #(#fields_ts),*
+                ])
+            }
+        }
+
+        impl #impl_generics #name #ty_generics #where_clause {
+            #(#idx_consts)*
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
 fn extract_table_name(attrs: &[syn::Attribute]) -> Option<String> {
     for attr in attrs {
         if attr.path().is_ident("orsx_table") {
@@ -124,6 +183,44 @@ fn rust_type_to_field_type(ty: &Type) -> proc_macro2::TokenStream {
         Some("Vector") => quote! { orsx::FieldType::Vector(384) },
         _ => quote! { orsx::FieldType::Text },
     }
+}
+
+fn rust_type_to_columnar_type(ty: &Type) -> syn::Result<proc_macro2::TokenStream> {
+    let name = type_name(ty);
+    let last = name.as_deref().unwrap_or_default();
+
+    let ts = match last {
+        "String" | "str" => quote! { orsx::columnar::ColumnarType::Utf8 },
+        "bool" => quote! { orsx::columnar::ColumnarType::Bool },
+        "i16" => quote! { orsx::columnar::ColumnarType::I16 },
+        "i32" => quote! { orsx::columnar::ColumnarType::I32 },
+        "i64" => quote! { orsx::columnar::ColumnarType::I64 },
+        "f32" => quote! { orsx::columnar::ColumnarType::F32 },
+        "f64" => quote! { orsx::columnar::ColumnarType::F64 },
+        // Support both `uuid::Uuid` and `sqlx::types::Uuid` (last segment is still `Uuid`).
+        "Uuid" => quote! { orsx::columnar::ColumnarType::Uuid },
+        // ORSX exports `Timestamp` and `SqlxTimestamp` aliases; both end in `Timestamp`.
+        "Timestamp" => quote! { orsx::columnar::ColumnarType::TimestampTzMicros },
+        "Vec" => {
+            match vec_inner_name(ty).as_deref() {
+                Some("u8") => quote! { orsx::columnar::ColumnarType::Bytes },
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "OrsxColumnar only supports Vec<u8> for varlen bytes; use Vec<u8> or add a custom mapping",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                ty,
+                format!("unsupported OrsxColumnar field type `{last}`; add a supported type or extend the macro mapping"),
+            ));
+        }
+    };
+
+    Ok(ts)
 }
 
 fn type_name(ty: &Type) -> Option<String> {

@@ -1,556 +1,368 @@
-# orsx
+# orsx (orsx2 rewrite, in progress)
 
-A lightweight PostgreSQL library for Rust that provides zero-loss schema migrations and automatic data compression. Built as a thin layer over sqlx, orsx focuses on migration safety and transparent compression while letting you write raw SQL for queries.
+This workspace contains a Rust library (`orsx`) and a proc-macro crate (`orsx-macros`).
 
-## What is orsx
+The current implementation focuses on three pieces:
 
-orsx is a database library that solves two specific problems:
+1. **Schema-driven Postgres migrations** (including an online rewrite path for large tables).
+2. **Columnar retrieval** into typed column buffers (COPY BINARY fast path + row-wise fallback).
+3. **Numeric vector compression** stored as `BYTEA` with a small self-describing envelope.
 
-1. **Safe schema migrations**: Automatically migrates PostgreSQL tables when your struct definitions change, with backup creation and data verification to prevent data loss.
+This README is written to match the repo state as of this checkout. It is not a promise of stability.
 
-2. **Transparent compression**: Stores large numeric vectors (prices, volumes, features) in compressed form using the cydec codec, automatically compressing on write and decompressing on read.
+## Non-goals
 
-The library provides derive macros for schema metadata but requires you to write SQL queries directly using sqlx. It does not provide an ORM, query builders, or CRUD abstractions.
+- No ORM and no query builder. You write SQL.
+- No cross-database support (Postgres only).
+- No automatic “struct ↔ row” mapping for columnar reads (columnar reads return `ColumnarBatch`, not `Vec<MyStruct>`).
 
-## Core Features
+## Crates
 
-- Zero-loss migration algorithm with automatic backup creation
-- Transparent compression for numeric vectors via `Compressed<T>` wrapper
-- Dynamic table name support for multi-timeframe data
-- Native jiff::Timestamp support via jiff-sqlx
-- PostgreSQL index management (B-tree, GIN, GiST, Hash)
-- Compile-time SQL verification when using sqlx::query! macro
-- Direct sqlx access with no query abstraction layer
+- `orsx/`: library (public API)
+- `orsx-macros/`: proc macros (`#[derive(OrsxMigrate)]`, `#[derive(OrsxColumnar)]`)
 
-## Installation
+## Quick start
 
-Add to your `Cargo.toml`:
+Add the crate and use `sqlx` for connections (orsx re-exports `sqlx`):
 
 ```toml
 [dependencies]
-orsx = "2.0"
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls"] }
+orsx = { path = "./orsx" }
 tokio = { version = "1", features = ["full"] }
 ```
 
-## Basic Usage
+## 1) Migrations (schema-driven, zero-loss-by-backup)
 
-### Define Your Schema
+### What it does
+
+You define a table schema in Rust via `#[derive(OrsxMigrate)]`. At runtime, `orsx::Migrations`:
+
+- creates tables that do not exist,
+- applies “safe ALTER” changes when possible (e.g. add a nullable column),
+- otherwise performs an **online rewrite**:
+  - creates a shadow table with the desired schema,
+  - installs a trigger that records changed primary keys into a changelog table,
+  - backfills data from the original table into the shadow table in chunks,
+  - applies changelog catch-up rounds,
+  - takes a short `ACCESS EXCLUSIVE` lock to drain remaining changes and swap tables,
+  - keeps a **backup table** with the original data.
+
+“Zero-loss” here means: when a rewrite happens, the old table is preserved as a backup table (not dropped).
+
+### Current limitations (important)
+
+The current online rewrite implementation has constraints that are enforced in code:
+
+- Online rewrite requires **exactly one primary key column**.
+- Introspection assumes the table is in the `public` schema.
+- Constraint handling is limited (single-column PK/unique are tracked; other constraints are not fully modeled).
+- Some diffs intentionally trigger rewrite (type changes, column position changes, drop column, etc.).
+
+### Basic example
 
 ```rust
 use orsx::prelude::*;
-use jiff::Timestamp;
 
-#[derive(OrsxMigrate, sqlx::FromRow, Debug)]
-#[orsx_table("users")]
-struct User {
+#[derive(OrsxMigrate)]
+#[orsx_table("my_table")]
+struct MyTable {
     #[orsx_column(primary_key)]
     id: String,
-    name: String,
-    email: Option<String>,  // Option<T> makes column nullable
-    created_at: Timestamp,
+    name_: String,
+    pwt: f64,
 }
-```
 
-### Run Migrations
-
-```rust
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pool = sqlx::PgPool::connect("postgresql://localhost/mydb").await?;
+async fn main() -> Result<()> {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let pool = sqlx::PgPool::connect(&db_url).await?;
 
-    // Create or update table schema
-    let dummy = User {
-        id: String::new(),
-        name: String::new(),
-        email: None,
-        created_at: Timestamp::now(),
-    };
-
+    let dummy = MyTable { id: "x".into(), name_: "n".into(), pwt: 0.0 };
     Migrations::init(&pool, &[(dummy, None)]).await?;
 
     Ok(())
 }
 ```
 
-### Write Queries with sqlx
+### Strict schema enforcement knobs
 
-orsx does not provide query methods. Use sqlx directly:
+The migration behavior is controlled by `orsx::migrations::config::MigrationConfig`:
 
-```rust
-// Insert
-sqlx::query!(
-    "INSERT INTO users (id, name, email, created_at) VALUES ($1, $2, $3, $4)",
-    "user_123",
-    "Alice",
-    Some("alice@example.com"),
-    Timestamp::now()
-)
-.execute(&pool)
-.await?;
+- `enforce_column_order`: if `true`, Postgres physical column order must match the Rust spec order; mismatches become rewrite-required.
+- `enforce_exact_columns`: if `true`, the live table must contain exactly the columns in the spec (no extras).
+- `allow_destructive_drops`: only relevant when `enforce_exact_columns=true`; if `true`, extra DB columns are removed from the live table **via rewrite**, but the backup table retains the original columns/data.
+- `allow_column_renames`: if `true`, fields annotated with `#[orsx_column(rename_from = "...")]` can be renamed via `ALTER TABLE ... RENAME COLUMN ...`.
 
-// Select
-let user = sqlx::query_as!(
-    User,
-    "SELECT * FROM users WHERE id = $1",
-    "user_123"
-)
-.fetch_one(&pool)
-.await?;
-
-// Update
-sqlx::query!(
-    "UPDATE users SET name = $1 WHERE id = $2",
-    "Alice Smith",
-    "user_123"
-)
-.execute(&pool)
-.await?;
-
-// Delete
-sqlx::query!(
-    "DELETE FROM users WHERE id = $1",
-    "user_123"
-)
-.execute(&pool)
-.await?;
-```
-
-### Batch Insert Operations
-
-orsx does not provide batch insert helpers. Use PostgreSQL's native batch insert syntax:
+Example:
 
 ```rust
-// Method 1: Single INSERT with multiple VALUES
-sqlx::query!(
-    "INSERT INTO users (id, name, email, created_at) VALUES
-     ($1, $2, $3, NOW()),
-     ($4, $5, $6, NOW()),
-     ($7, $8, $9, NOW())",
-    "user_1", "Alice", Some("alice@example.com"),
-    "user_2", "Bob", Some("bob@example.com"),
-    "user_3", "Charlie", None::<String>
-)
-.execute(&pool)
-.await?;
-
-// Method 2: UNNEST for larger batches
-let ids = vec!["user_1", "user_2", "user_3"];
-let names = vec!["Alice", "Bob", "Charlie"];
-let emails: Vec<Option<&str>> = vec![Some("alice@example.com"), Some("bob@example.com"), None];
-
-sqlx::query!(
-    "INSERT INTO users (id, name, email, created_at)
-     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(id, name, email)
-     CROSS JOIN (SELECT NOW() as created_at) c",
-    &ids[..],
-    &names[..],
-    &emails as &[Option<&str>]
-)
-.execute(&pool)
-.await?;
-
-// Method 3: COPY for maximum performance (requires raw CSV data)
-use sqlx::postgres::PgCopyIn;
-
-let mut copy = pool.copy_in_raw(
-    "COPY users (id, name, email, created_at) FROM STDIN WITH (FORMAT CSV)"
-).await?;
-
-for i in 0..1000 {
-    let csv_row = format!("user_{},Name{},email{}@example.com,2025-01-15T00:00:00Z\n", i, i, i);
-    copy.send(csv_row.as_bytes()).await?;
-}
-
-copy.finish().await?;
-```
-
-## Compressed Fields
-
-Store large numeric vectors in compressed form to save database space:
-
-```rust
+use orsx::migrations::config::MigrationConfig;
 use orsx::prelude::*;
 
-#[derive(OrsxMigrate, sqlx::FromRow)]
-#[orsx_table("market_data")]
-struct MarketData {
-    #[orsx_column(primary_key)]
-    id: String,
-    symbol: String,
-    prices: Compressed<f64>,   // Compressed Vec<f64>
-    volumes: Compressed<i64>,  // Compressed Vec<i64>
-}
-
-// Insert with compression (automatic)
-let data = MarketData {
-    id: "btc_1h".to_string(),
-    symbol: "BTCUSDT".to_string(),
-    prices: Compressed::new(vec![100.0, 101.5, 102.0, 103.5]),
-    volumes: Compressed::new(vec![1000, 1100, 1050, 1200]),
+let cfg = MigrationConfig {
+    enforce_column_order: true,
+    enforce_exact_columns: true,
+    allow_destructive_drops: true,
+    ..MigrationConfig::default()
 };
 
-sqlx::query!(
-    "INSERT INTO market_data (id, symbol, prices, volumes) VALUES ($1, $2, $3, $4)",
-    data.id,
-    data.symbol,
-    &data.prices as &Compressed<f64>,
-    &data.volumes as &Compressed<i64>
-)
-.execute(&pool)
-.await?;
-
-// Retrieve with decompression (automatic)
-let retrieved = sqlx::query_as!(
-    MarketData,
-    "SELECT * FROM market_data WHERE id = $1",
-    "btc_1h"
-)
-.fetch_one(&pool)
-.await?;
-
-// Access decompressed data
-let prices: &[f64] = retrieved.prices.as_slice();
-let volumes: &[i64] = retrieved.volumes.as_slice();
+Migrations::init_with_config(&pool, &[(dummy, None)], &cfg).await?;
 ```
 
-Supported compressed types:
+## 2) Columnar retrieval (COPY BINARY + row-wise)
 
-- `Compressed<i32>`, `Compressed<i64>`
-- `Compressed<u32>`, `Compressed<u64>`
-- `Compressed<f32>`, `Compressed<f64>`
+### What it does
 
-All compressed types are stored as PostgreSQL `BYTEA` columns using the cydec compression codec.
+You provide:
 
-## Dynamic Table Names
+- a `SELECT ...` query,
+- a `ColumnarSchema` describing the expected columns (order matters),
 
-Create multiple tables from the same struct definition:
+and you get a `ColumnarBatch` with:
+
+- typed fixed-width buffers (`Vec<i64>`, `Vec<u64>` bits for f64, etc.),
+- varlen buffers as offsets + a single `Vec<u8>` data blob (with a helper to coalesce),
+- a validity bitmap per column to represent NULLs.
+
+There are two readers:
+
+- `CopyBinaryBatchReader`: uses `COPY (SELECT ...) TO STDOUT (FORMAT BINARY)` and parses the stream.
+- `RowWiseBatchReader`: uses `sqlx::query(select_sql).fetch(...)` and `try_get` per cell, but still fills a `ColumnarBatch`.
+
+There is also:
+
+- `ColumnarBatchReader` + `ColumnarReaderMode::Auto(...)`: chooses COPY vs row-wise based on expected query shape (still returns `ColumnarBatch` either way).
+
+### Supported column types (current)
+
+`ColumnarType` supports:
+
+- `Bool`, `I16`, `I32`, `I64`
+- `F32`, `F64` (stored as IEEE754 bits)
+- `Uuid` (16 bytes)
+- `TimestampTzMicros` (i64 microseconds since Unix epoch)
+- `Utf8` (raw bytes + optional UTF-8 validation)
+- `Bytes` (raw bytes)
+
+Unsupported types should be treated as “not implemented yet” rather than “silently coerced”.
+
+### Example: schema from a struct (no rewrite of your struct)
+
+`#[derive(orsx::OrsxColumnar)]` generates:
+
+- `MyTable::columnar_schema() -> Result<ColumnarSchema>`
+- `MyTable::COL_<FIELD>` index constants
 
 ```rust
-#[derive(OrsxMigrate, sqlx::FromRow)]
-#[orsx_table("regime_data")]
-struct RegimeData {
-    #[orsx_column(primary_key)]
-    id: String,
-    trend: f64,
-    volatility: f64,
+use orsx::columnar::{ColumnarBatch, ColumnarBatchReader, ColumnarReaderMode, OrsxColumnar};
+
+#[derive(orsx::OrsxColumnar)]
+struct MyTable {
+    name_: String,
+    pwt: f64,
 }
 
-// Create multiple timeframe tables
-let timeframes = ["1h", "4h", "12h", "1d"];
+async fn read_batch(conn: &mut sqlx::PgConnection) -> orsx::Result<ColumnarBatch> {
+    let schema = MyTable::columnar_schema()?;
+    let mut batch = ColumnarBatch::new(schema.clone(), 100_000)?;
 
-for tf in &timeframes {
-    let table_name = format!("regime_{}", tf);
-    let dummy = RegimeData {
-        id: String::new(),
-        trend: 0.0,
-        volatility: 0.0,
-    };
+    let sql = "SELECT name_, pwt FROM my_table ORDER BY name_";
+    let mut reader = ColumnarBatchReader::new_select_unchecked(
+        conn,
+        sql,
+        schema,
+        ColumnarReaderMode::Auto(Default::default()),
+    )
+    .await?;
 
-    Migrations::init(&pool, &[(dummy, Some(&table_name))]).await?;
+    let _rows = reader.next_batch_into(&mut batch).await?;
+    Ok(batch)
 }
-
-// Query specific timeframe using raw SQL
-let data_1h = sqlx::query_as!(
-    RegimeData,
-    "SELECT * FROM regime_1h WHERE id = $1",
-    "btcusdt"
-)
-.fetch_one(&pool)
-.await?;
 ```
 
-### TableQuery Trait (Optional Dynamic Operations)
+Notes:
 
-If you need runtime table name selection, orsx provides a `TableQuery` trait with helper methods. Note that these methods sacrifice compile-time SQL verification:
+- The `*_unchecked` name is intentional: ORSX does not parse or sanitize your SQL. Use parameter binding for values.
+- For the row-wise reader, `select_sql` must outlive the reader (pass a long-lived `&str`, not a temporary `String`).
+
+### Accessing columns
+
+```rust
+let name_offsets = batch.var_chunks(MyTable::COL_NAME_).unwrap().0;
+let mut name_data = Vec::new();
+batch.coalesce_var_into(MyTable::COL_NAME_, &mut name_data)?;
+
+let pwt_bits = batch.fixed_f64_bits(MyTable::COL_PWT).unwrap();
+let pwt0 = f64::from_bits(pwt_bits[0]);
+
+// For row i:
+let i = 123usize;
+let start = name_offsets[i] as usize;
+let end = name_offsets[i + 1] as usize;
+let name_i = std::str::from_utf8(&name_data[start..end]).unwrap();
+```
+
+### ORSXCOL envelope (binary transport)
+
+`orsx::columnar::encode_orsxcol_v1_into` encodes a `ColumnarBatch` into a versioned byte buffer.
+`decode_orsxcol_v1(_into)` decodes and validates it.
+
+This is intended for “send batch over the wire / store in cache” use cases.
+
+## 3) Compressed vectors (`Compressed<T>`)
+
+`Compressed<T>` stores a numeric vector as `BYTEA` with an envelope:
+
+- magic/version
+- codec id + element type id
+- element count + uncompressed byte length
+- CRC32 of the compressed payload
+- payload bytes
+
+This is not generic “data compression”; it is a narrow mechanism for numeric vectors.
+
+Example (insert + select):
+
+```rust
+use orsx::{Compressed, CompressedWorkspace};
+use sqlx::Row;
+
+let v = Compressed(vec![1.0_f64, 2.0, 3.0]);
+let mut ws = CompressedWorkspace::default();
+let mut bytes = Vec::new();
+v.encode_envelope_into(&mut bytes, &mut ws)?;
+
+sqlx::query("INSERT INTO my_vecs (id, payload) VALUES ($1, $2)")
+    .bind("row1")
+    .bind(bytes)
+    .execute(&pool)
+    .await?;
+
+let raw: Vec<u8> = sqlx::query("SELECT payload FROM my_vecs WHERE id = $1")
+    .bind("row1")
+    .fetch_one(&pool)
+    .await?
+    .try_get(0)?;
+
+let decoded = Compressed::<f64>::decode_envelope(&raw)?;
+assert_eq!(decoded.as_slice(), &[1.0, 2.0, 3.0]);
+```
+
+## Full workflow example (migrate → write → columnar read → encode for API)
+
+This example shows one possible “end-to-end” flow. It is intentionally explicit about SQL and schema.
 
 ```rust
 use orsx::prelude::*;
+use orsx::columnar::{ColumnarBatch, ColumnarBatchReader, ColumnarReaderMode, OrsxColumnar, encode_orsxcol_v1_into};
 
-#[derive(OrsxMigrate, sqlx::FromRow)]
-#[orsx_table("regime_data")]
-struct RegimeData {
+#[derive(OrsxMigrate, orsx::OrsxColumnar)]
+#[orsx_table("wf_items")]
+struct Item {
     #[orsx_column(primary_key)]
     id: String,
-    trend: f64,
+    name_: String,
+    pwt: f64,
 }
 
-// Insert into dynamically selected table
-let data = RegimeData { id: "btc".to_string(), trend: 0.75 };
-data.insert_into_table(&pool, "regime_1h").await?;
-
-// Update in dynamically selected table
-data.update_in_table(&pool, "regime_1h").await?;
-
-// Delete from dynamically selected table
-RegimeData::delete_from_table(&pool, "regime_1h", "btc").await?;
-
-// Fetch all from table
-let all_data = RegimeData::fetch_all_from_table(&pool, "regime_1h").await?;
-
-// Count records
-let count = RegimeData::count_in_table(&pool, "regime_1h").await?;
-
-// Find by primary key
-let found = RegimeData::find_by_id_in_table(&pool, "regime_1h", "btc").await?;
-```
-
-These methods are useful for multi-timeframe patterns where table names are computed at runtime. For static table names, use `sqlx::query!` directly for compile-time verification.
-
-## Migration System
-
-### How Migrations Work
-
-When you run `Migrations::init()`, orsx:
-
-1. Checks if the table exists. If not, creates it.
-2. Reads the current table schema from PostgreSQL.
-3. Compares it to your struct definition.
-4. If schemas match, does nothing.
-5. If schemas differ, executes a zero-loss migration:
-   - Creates temporary table with new schema
-   - Copies all data from original table
-   - Renames original table to backup (e.g., `users_backup_1234567890`)
-   - Renames temporary table to original name
-   - Verifies row count matches
-   - Cleans up old backups per retention policy
-
-### Schema Changes Detected
-
-- Added columns (with appropriate defaults)
-- Removed columns (preserved in backup table)
-- Type changes (with automatic conversion when possible)
-- Nullability changes
-- Index changes
-
-### Migration Configuration
-
-```rust
-use orsx::migrations::MigrationConfig;
-
-let config = MigrationConfig {
-    backup_suffix: "backup".to_string(),
-    max_backups_per_table: 5,           // Keep last 5 backups
-    backup_retention_days: Some(30),     // Delete backups older than 30 days
-};
-
-Migrations::init_with_config(&pool, &[(dummy, None)], &config).await?;
-```
-
-### Migration Safety
-
-- All migrations run inside PostgreSQL transactions
-- Backups are created before any schema changes
-- Row count verification prevents silent data loss
-- Failed migrations roll back automatically
-- Old backups are cleaned up per retention policy
-- Running migrations multiple times is safe (idempotent)
-
-## Index Support
-
-Define indexes using field attributes:
-
-```rust
-#[derive(OrsxMigrate, sqlx::FromRow)]
-#[orsx_table("users")]
-struct User {
-    #[orsx_column(primary_key)]
-    id: String,
-
-    #[orsx_column(index)]
-    email: String,
-
-    #[orsx_column(index(unique))]
-    username: String,
-
-    #[orsx_column(index(type = "gin"))]
-    tags: Vec<String>,
-}
-```
-
-Supported index types:
-
-- `btree` (default)
-- `hash`
-- `gin` (for arrays, jsonb)
-- `gist` (for geometric types, full-text search)
-
-Indexes are created during migrations if they don't exist.
-
-## Type Mapping
-
-### Native Types
-
-| Rust Type          | PostgreSQL Type    |
-| ------------------ | ------------------ |
-| `String`           | `TEXT`             |
-| `i32`              | `INTEGER`          |
-| `i64`              | `BIGINT`           |
-| `f32`              | `REAL`             |
-| `f64`              | `DOUBLE PRECISION` |
-| `bool`             | `BOOLEAN`          |
-| `jiff::Timestamp`  | `TIMESTAMPTZ`      |
-| `Vec<u8>`          | `BYTEA`            |
-| `Option<T>`        | Nullable column    |
-| `pgvector::Vector` | `vector(N)`        |
-
-### Compressed Types
-
-| Rust Type         | PostgreSQL Type | Storage               |
-| ----------------- | --------------- | --------------------- |
-| `Compressed<i32>` | `BYTEA`         | Compressed `Vec<i32>` |
-| `Compressed<i64>` | `BYTEA`         | Compressed `Vec<i64>` |
-| `Compressed<u32>` | `BYTEA`         | Compressed `Vec<u32>` |
-| `Compressed<u64>` | `BYTEA`         | Compressed `Vec<u64>` |
-| `Compressed<f32>` | `BYTEA`         | Compressed `Vec<f32>` |
-| `Compressed<f64>` | `BYTEA`         | Compressed `Vec<f64>` |
-
-## Testing
-
-### Unit Tests (No Database Required)
-
-```bash
-cargo test --test core_functionality
-```
-
-Tests the derive macro code generation and type mapping without requiring a PostgreSQL instance.
-
-### Integration Tests (Requires PostgreSQL)
-
-```bash
-# Start PostgreSQL (example using Docker)
-docker run -d \
-  --name orsx-test-db \
-  -e POSTGRES_PASSWORD=password \
-  -p 5432:5432 \
-  postgres:15
-
-# Set database URL
-export TEST_DATABASE_URL="postgresql://postgres:password@localhost/postgres"
-
-# Run integration tests
-cargo test --test integration_tests -- --ignored
-```
-
-### Examples
-
-Run examples to see orsx in action:
-
-```bash
-export DATABASE_URL="postgresql://postgres:password@localhost/orso_example"
-
-# Basic CRUD operations
-cargo run --example basic_crud
-
-# Compression demonstration
-cargo run --example compression
-
-# Multi-timeframe pattern (MATHILDE use case)
-cargo run --example mathilde_pattern
-```
-
-## Performance Notes
-
-orsx achieves fast performance by:
-
-- Zero abstraction over sqlx native types
-- Direct SQL execution without query builders
-- No intermediate value conversions
-- Compile-time SQL verification (when using `sqlx::query!`)
-- Efficient compression using cydec codec
-
-For bulk operations, use PostgreSQL's native batch insert syntax (`UNNEST`, `COPY`) rather than loops.
-
-## Comparison to V1 (orso-postgres)
-
-orsx is a simplified evolution of orso-postgres V1:
-
-**What Changed:**
-
-- Removed ORM layer (no more `insert()`, `update()`, `delete()` methods on structs)
-- Removed query builders (no more `FilterOperator`, `Filter`, `Operator`)
-- Removed `Value` enum wrapper (use native types)
-- Direct sqlx usage required for all queries
-- Migration system preserved with same algorithm
-- Compression requires explicit `Compressed<T>` wrapper
-
-**What Stayed:**
-
-- Zero-loss migration algorithm
-- Migration backup and verification
-- Dynamic table name support
-- jiff::Timestamp support
-- Same migration initialization API
-
-**Migration Path:**
-
-Old (V1):
-
-```rust
-user.insert(db).await?;
-let users = User::find_where(filter, db).await?;
-```
-
-New (orsx):
-
-```rust
-sqlx::query!("INSERT INTO users (id, name) VALUES ($1, $2)", user.id, user.name)
-    .execute(&pool).await?;
-let users = sqlx::query_as!(User, "SELECT * FROM users WHERE active = $1", true)
-    .fetch_all(&pool).await?;
-```
-
-## Error Handling
-
-orsx defines a `Result<T>` type that wraps potential errors:
-
-```rust
-use orsx::prelude::*;
-
-async fn example(pool: &PgPool) -> Result<()> {
-    // Migration errors
+#[tokio::main]
+async fn main() -> Result<()> {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let pool = sqlx::PgPool::connect(&db_url).await?;
+
+    // 1) Migrate (create or update schema)
+    let dummy = Item { id: "x".into(), name_: "n".into(), pwt: 0.0 };
     Migrations::init(&pool, &[(dummy, None)]).await?;
 
-    // Query errors (from sqlx)
-    sqlx::query!("INSERT INTO users (id) VALUES ($1)", "user_1")
-        .execute(pool)
+    // 2) Write some rows (raw SQL)
+    sqlx::query("INSERT INTO wf_items (id, name_, pwt) VALUES ($1,$2,$3) ON CONFLICT (id) DO UPDATE SET name_ = EXCLUDED.name_, pwt = EXCLUDED.pwt")
+        .bind("1")
+        .bind("alice")
+        .bind(1.25_f64)
+        .execute(&pool)
         .await?;
 
+    // 3) Columnar read
+    let mut conn = pool.acquire().await?;
+    let schema = Item::columnar_schema()?;
+    let mut batch = ColumnarBatch::new(schema.clone(), 100_000)?;
+
+    let sql = "SELECT name_, pwt FROM wf_items ORDER BY id";
+    let mut reader = ColumnarBatchReader::new_select_unchecked(
+        &mut conn,
+        sql,
+        schema,
+        ColumnarReaderMode::Auto(Default::default()),
+    )
+    .await?;
+    let _rows = reader.next_batch_into(&mut batch).await?;
+
+    // 4) Encode for transport
+    let mut out = Vec::new();
+    encode_orsxcol_v1_into(&batch, &mut out)?;
+    // `out` can be returned from an API or written to disk.
+
     Ok(())
 }
 ```
 
-Error types:
+## Performance (from real logs in this repo)
 
-- `Error::Migration`: Schema migration failures with SQL context
-- `Error::Database`: Wrapped sqlx errors
-- `Error::Compression`: Compression/decompression failures
-- `Error::Schema`: Schema validation errors
+### Columnar retrieval
 
-## Design Philosophy
+All of these numbers are from `protocols/orsx2_evidence/columnar_trials.md` and are “release” builds.
 
-orsx follows these principles:
+From `protocols/orsx2_evidence/columnar_trials.md`:
 
-1. **Thin layer over sqlx**: Minimal abstraction, maximum control
-2. **Migration safety first**: Never lose data during schema changes
-3. **Explicit over implicit**: Compression and table names are explicit
-4. **Compile-time verification**: Use sqlx::query! for static SQL checking
-5. **PostgreSQL-specific**: Optimized for PostgreSQL, not database-agnostic
+- 2026-01-14 14:40:38Z:
+  - 100k × 50 cols: COPY → `ColumnarBatch` `262.405752ms`, row-wise → `ColumnarBatch` `299.598514ms`
+  - 100k × 500 cols: COPY → `ColumnarBatch` `2.430023982s`, row-wise → `ColumnarBatch` `2.892875905s`
+- 2026-01-14 14:41:55Z:
+  - 1M × 50 cols: COPY → `ColumnarBatch` `2.75208442s`, row-wise → `ColumnarBatch` `2.528227132s` (row-wise is faster here)
 
-orsx does not try to be an ORM. It solves two specific problems (migrations and compression) and lets you write SQL for everything else.
+Exact commands used for these trials are recorded in the log entries.
 
-## Documentation
+### Migrations (online rewrite)
 
-Generate full API documentation:
+All of these numbers are from `protocols/orsx2_evidence/migration_trials.md` and are “release” builds.
 
-```bash
-cargo doc --open
-```
+From `protocols/orsx2_evidence/migration_trials.md`:
 
-## License
+- 2026-01-14T10:48:43Z (UUID PK, 1,000,000 seeded + 100,000 writer inserts):
+  - cutover lock: ~`1012ms` (budget `5000ms`)
+  - backfill: ~`21.324s` (rows reported: `1,100,000`)
+  - total online rewrite: ~`26.014s`
+- 2026-01-14T11:53:05Z (strict order/exact enforced on 1M rows, forces rewrite):
+  - strict migration: ~`7.70s` vs default alter ~`34.8ms`
 
-MIT OR Apache-2.0
+These are workload- and hardware-dependent; they are meant as evidence of current behavior, not a guarantee.
 
-## Credits
+## Running tests locally
 
-Built by TIA Lab for the MATHILDE cryptocurrency technical analysis platform.
+Most integration tests require a running Postgres.
+
+Environment variable used by tests:
+
+- `ORSX_TEST_DATABASE_URL` (defaults to `postgresql://orsx:orsx@localhost:15432/orsx2_test`)
+
+Useful commands:
+
+- Unit tests (no DB): `cargo test -p orsx --lib`
+- DB correctness tests (require Postgres):
+  - `cargo test -p orsx --test columnar_copy_binary --release`
+  - `cargo test -p orsx --test migrations_strict_correctness`
+- Perf / large-table tests (ignored by default; require Postgres and time):
+  - `cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+  - `cargo test -p orsx --test migrations_online_big_uuid --release -- --ignored --nocapture`
+
+Some large-table tests create the `uuid-ossp` extension (`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`).
+
+## Repo protocols and evidence logs
+
+The rewrite work in this repo tracks decisions and results in `protocols/`:
+
+- `protocols/orsx2_rewrite_protocol.md`
+- Specs: `protocols/orsx2_specs/`
+- Append-only evidence logs:
+  - `protocols/orsx2_evidence/migration_trials.md`
+  - `protocols/orsx2_evidence/columnar_trials.md`

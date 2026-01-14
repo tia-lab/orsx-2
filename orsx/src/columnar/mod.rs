@@ -7,3 +7,7 @@ pub use types::{
     ColumnarReaderMode, ColumnarSchema, ColumnarType, CopyBinaryBatchReader,
     CopyBinaryBatchReaderConfig, RowWiseBatchReader,
 };
+
+pub trait OrsxColumnar {
+    fn columnar_schema() -> crate::Result<ColumnarSchema>;
+}

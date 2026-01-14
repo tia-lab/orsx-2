@@ -29,10 +29,12 @@ pub fn quote_identifier(name: &str) -> String {
 }
 
 pub use orsx_macros::OrsxMigrate;
+pub use orsx_macros::OrsxColumnar;
 
 pub mod prelude {
     pub use crate::{quote_identifier, ColumnSpec, Config, Error, FieldType, IndexInfo, IndexType};
     pub use crate::{Migrations, OrsxMigrate, Result, TableSpec};
+    pub use crate::OrsxColumnar;
     pub use crate::{Compressed, CompressedWorkspace};
     pub use crate::{
         ColumnarAutoConfig, ColumnarBatch, ColumnarBatchReader, ColumnarField, ColumnarReaderMode,
