@@ -1,6 +1,7 @@
 use crate::{quote_identifier, indexes::IndexInfo, schema::TableSpec};
 
 use super::introspection::{ColumnInfo, TableSchema};
+use super::config::MigrationConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaDiff {
@@ -95,12 +96,12 @@ pub fn diff_schema(current: &TableSchema, expected: &TableSchema) -> Vec<SchemaD
     diffs
 }
 
-pub fn filter_ignored_diffs(diffs: Vec<SchemaDiff>) -> Vec<SchemaDiff> {
+pub fn filter_ignored_diffs(cfg: &MigrationConfig, diffs: Vec<SchemaDiff>) -> Vec<SchemaDiff> {
     diffs.into_iter()
-        // Column order is not a compatibility requirement for Postgres, and forcing it is expensive.
-        .filter(|d| !matches!(d, SchemaDiff::PositionChanged { .. }))
-        // Extra columns in DB are tolerated by default (non-destructive; avoids data loss).
-        .filter(|d| !matches!(d, SchemaDiff::ColumnRemoved(_)))
+        // Column order is only enforced when explicitly requested.
+        .filter(|d| cfg.enforce_column_order || !matches!(d, SchemaDiff::PositionChanged { .. }))
+        // Extra columns in DB are only rejected when explicitly requested.
+        .filter(|d| cfg.enforce_exact_columns || !matches!(d, SchemaDiff::ColumnRemoved(_)))
         .collect()
 }
 
@@ -136,6 +137,7 @@ pub async fn apply_safe_alters(
     pool: &sqlx::PgPool,
     table_name: &str,
     spec: &TableSpec,
+    cfg: &MigrationConfig,
     current: &TableSchema,
     expected: &TableSchema,
     diffs: &[SchemaDiff],
@@ -147,6 +149,10 @@ pub async fn apply_safe_alters(
     for diff in diffs_sorted {
         match diff {
             SchemaDiff::ColumnAdded(col) => {
+                if cfg.enforce_column_order {
+                    // Adding a column via ALTER TABLE appends at the end; for strict order we require rewrite.
+                    continue;
+                }
                 let spec = expected
                     .columns
                     .iter()
@@ -228,6 +234,69 @@ pub async fn apply_safe_alters(
 
     let _ = current;
     Ok(())
+}
+
+pub fn validate_strictness(cfg: &MigrationConfig, diffs: &[SchemaDiff]) -> crate::Result<()> {
+    if cfg.enforce_exact_columns && !cfg.allow_destructive_drops {
+        if diffs.iter().any(|d| matches!(d, SchemaDiff::ColumnRemoved(_))) {
+            return Err(crate::Error::MigrationNeeded(
+                "database has extra columns; enable allow_destructive_drops to rewrite and remove them (backup is kept)"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub async fn apply_safe_renames(
+    pool: &sqlx::PgPool,
+    table_name: &str,
+    spec: &TableSpec,
+    cfg: &MigrationConfig,
+    current: &TableSchema,
+) -> crate::Result<Option<TableSchema>> {
+    if !cfg.allow_column_renames {
+        return Ok(None);
+    }
+
+    let mut renames: Vec<(&'static str, &'static str)> = spec
+        .columns
+        .iter()
+        .filter_map(|c| c.rename_from.map(|from| (from, c.name)))
+        .collect();
+    if renames.is_empty() {
+        return Ok(None);
+    }
+    renames.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(b.1)));
+
+    let mut current_cols: std::collections::HashSet<String> =
+        current.columns.iter().map(|c| c.name.clone()).collect();
+
+    let mut any = false;
+    for (from, to) in renames {
+        if current_cols.contains(to) {
+            continue;
+        }
+        if !current_cols.contains(from) {
+            continue;
+        }
+        let sql = format!(
+            "ALTER TABLE {} RENAME COLUMN {} TO {}",
+            quote_identifier(table_name),
+            quote_identifier(from),
+            quote_identifier(to),
+        );
+        sqlx::query(&sql).execute(pool).await?;
+        current_cols.remove(from);
+        current_cols.insert(to.to_string());
+        any = true;
+    }
+
+    if any {
+        let updated = super::introspection::read_table_schema(pool, table_name).await?;
+        return Ok(Some(updated));
+    }
+    Ok(None)
 }
 
 fn diff_sort_key(d: &SchemaDiff) -> (u8, String) {

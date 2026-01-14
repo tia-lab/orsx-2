@@ -30,10 +30,12 @@ pub fn derive_orsx_migrate(input: TokenStream) -> TokenStream {
                 let is_pk = has_flag(&field.attrs, "primary_key");
                 let is_unique = has_flag(&field.attrs, "unique");
                 let default_sql = parse_default_sql(&field.attrs);
+                let rename_from = parse_rename_from(&field.attrs);
 
                 columns.push(quote! {
                     orsx::ColumnSpec {
                         name: #field_name,
+                        rename_from: #rename_from,
                         ty: #field_type,
                         nullable: #nullable,
                         primary_key: #is_pk,
@@ -216,6 +218,26 @@ fn parse_default_sql(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
         let mut found: Option<String> = None;
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("default_sql") {
+                let v: LitStr = meta.value()?.parse()?;
+                found = Some(v.value());
+            }
+            Ok(())
+        });
+        if let Some(v) = found {
+            return quote! { Some(#v) };
+        }
+    }
+    quote! { None }
+}
+
+fn parse_rename_from(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+    for attr in attrs {
+        if !attr.path().is_ident("orsx_column") {
+            continue;
+        }
+        let mut found: Option<String> = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_from") {
                 let v: LitStr = meta.value()?.parse()?;
                 found = Some(v.value());
             }

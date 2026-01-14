@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use orsx::migrations::introspection::{ColumnInfo, TableSchema};
+use orsx::migrations::config::MigrationConfig;
 use orsx::migrations::planning::{diff_schema, expected_schema_from_spec, filter_ignored_diffs};
 use orsx::{ColumnSpec, FieldType, IndexInfo, IndexType, TableSpec};
 
@@ -11,6 +12,7 @@ fn make_spec(cols: usize) -> TableSpec {
         let name = Box::leak(format!("c_{i}").into_boxed_str());
         v.push(ColumnSpec {
             name,
+            rename_from: None,
             ty: FieldType::Text,
             nullable: true,
             primary_key: i == 0,
@@ -66,7 +68,8 @@ fn bench_planning(c: &mut Criterion) {
                 },
                 |(current, expected)| {
                     let diffs = diff_schema(&current, &expected);
-                    let _ = filter_ignored_diffs(diffs);
+                    let cfg = MigrationConfig::default();
+                    let _ = filter_ignored_diffs(&cfg, diffs);
                 },
                 BatchSize::SmallInput,
             );

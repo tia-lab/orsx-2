@@ -5,6 +5,14 @@ pub struct MigrationConfig {
     pub online_sleep_ms: u64,
     pub max_online_catchup_rounds: u32,
     pub cutover_lock_budget_ms: u64,
+    /// Enforce that physical column order in Postgres matches the spec (by rewriting when needed).
+    pub enforce_column_order: bool,
+    /// Enforce that the DB has exactly the same columns as the spec (no extras).
+    pub enforce_exact_columns: bool,
+    /// Allow online rewrite to remove extra DB columns from the live table (backup table is kept).
+    pub allow_destructive_drops: bool,
+    /// Allow `#[orsx_column(rename_from = \"...\")]` to rename columns using `ALTER TABLE ... RENAME COLUMN ...`.
+    pub allow_column_renames: bool,
 }
 
 impl Default for MigrationConfig {
@@ -15,7 +23,10 @@ impl Default for MigrationConfig {
             online_sleep_ms: 0,
             max_online_catchup_rounds: 50,
             cutover_lock_budget_ms: 5_000,
+            enforce_column_order: false,
+            enforce_exact_columns: false,
+            allow_destructive_drops: false,
+            allow_column_renames: true,
         }
     }
 }
-

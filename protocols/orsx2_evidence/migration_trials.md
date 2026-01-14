@@ -126,3 +126,60 @@ Outcome:
 - Catchup (pre-lock) duration: ~3.559s (drained_pk reported: 90,000)
 - Total online rewrite duration (inside `online_rewrite_table`): ~26.014s (migrations wrapper logged ~26.086s)
 - Verification method and result: `new_col IS NULL = 0` and final rowcount; OK
+
+---
+
+## Online rewrite: worst-case writer (UUID PK, 1M rows, release)
+
+Date (UTC): 2026-01-14T11:04:49Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 1,000,000 seeded
+- Columns: `id UUID` PK + 49 `INTEGER NOT NULL` + new `INTEGER NOT NULL DEFAULT 0`
+- Write load during test (during migration):
+  - inserts: 100,000
+  - updates: 500,000 (batched updates of 50,000 rows per statement)
+  - deletes: 50,000 (batched deletes of 10,000 rows per statement)
+
+Migration case:
+- Change type: add `new_col INTEGER NOT NULL DEFAULT 0` (rewrite-class change)
+- Strategy (offline/online): online shadow-table rewrite; trigger records PK changelog; migration process applies changelog to shadow; 5s cutover budget
+
+Command(s):
+- `ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_UPDATE_ROWS=500000 ORSX_BIG_UPDATE_BATCH=50000 ORSX_BIG_DELETE_ROWS=50000 ORSX_BIG_DELETE_BATCH=10000 cargo test -p orsx --release --test migrations_online_big_uuid -- --ignored --nocapture`
+
+Outcome:
+- Success/failure: success
+- Cutover lock duration: ~2101ms (budget 5000ms)
+- Backfill duration: ~24.132s (backfill_rows reported: 1,080,000)
+- Catchup (pre-lock) duration: ~25.211s (drained_pk reported: 590,000)
+- Total online rewrite duration (inside `online_rewrite_table`): ~52.080s
+- Writer summary: inserted=100,000 updated=500,000 deleted=50,000; final rowcount=1,050,000
+- Verification method and result: `new_col IS NULL = 0` and final rowcount matches inserts/deletes; OK
+
+---
+
+## Correctness: strict schema enforcement + rename
+
+Date (UTC): 2026-01-14T11:33:59Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Cases:
+- Enforced physical column order (rewrite required) + data preserved
+- Enforced exact columns (fails unless `allow_destructive_drops=true`; rewrite removes extras; backup retains dropped data)
+- `rename_from` safe rename (`ALTER TABLE ... RENAME COLUMN ...`) + data preserved
+
+Command(s):
+- `cargo test -p orsx --test migrations_strict_correctness`
+
+Outcome:
+- Success/failure: success (4 tests)

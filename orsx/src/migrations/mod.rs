@@ -58,29 +58,41 @@ impl Migrations {
                     break;
                 }
 
-                let current = introspection::read_table_schema(pool, table_name).await?;
-                let diff = planning::filter_ignored_diffs(planning::diff_schema(&current, &expected));
+                let current0 = introspection::read_table_schema(pool, table_name).await?;
+                let current = if let Some(updated) =
+                    planning::apply_safe_renames(pool, table_name, &spec, cfg, &current0).await?
+                {
+                    updated
+                } else {
+                    current0
+                };
+                let diff = planning::filter_ignored_diffs(
+                    cfg,
+                    planning::diff_schema(&current, &expected),
+                );
+                planning::validate_strictness(cfg, &diff)?;
                 if diff.is_empty() {
                     break;
                 }
 
-                planning::apply_safe_alters(pool, table_name, &spec, &current, &expected, &diff)
+                planning::apply_safe_alters(pool, table_name, &spec, cfg, &current, &expected, &diff)
                     .await?;
             }
 
             let after = introspection::read_table_schema(pool, table_name).await?;
-            let after_diff =
-                planning::filter_ignored_diffs(planning::diff_schema(&after, &expected));
+            let after_diff = planning::filter_ignored_diffs(cfg, planning::diff_schema(&after, &expected));
+            planning::validate_strictness(cfg, &after_diff)?;
 
             if !after_diff.is_empty() {
                 // Online rewrite path for remaining diffs (large-table safe).
                 online::online_rewrite_table(pool, table_name, &spec, &after, &expected, cfg).await?;
 
                 let final_schema = introspection::read_table_schema(pool, table_name).await?;
-                let final_diff = planning::filter_ignored_diffs(planning::diff_schema(
+                let final_diff = planning::filter_ignored_diffs(cfg, planning::diff_schema(
                     &final_schema,
                     &expected,
                 ));
+                planning::validate_strictness(cfg, &final_diff)?;
                 if !final_diff.is_empty() {
                     return Err(Error::MigrationNeeded(format!(
                         "table {table_name} still differs after online rewrite: {final_diff:?}"

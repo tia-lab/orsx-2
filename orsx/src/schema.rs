@@ -3,6 +3,9 @@ use crate::{indexes::IndexInfo, quote_identifier, types::FieldType};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSpec {
     pub name: &'static str,
+    /// If set, this column is allowed to be renamed from the given existing DB column name.
+    /// Used to perform `ALTER TABLE ... RENAME COLUMN ...` or to map source columns during online rewrite.
+    pub rename_from: Option<&'static str>,
     pub ty: FieldType,
     pub nullable: bool,
     pub primary_key: bool,

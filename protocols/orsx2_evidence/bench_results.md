@@ -123,3 +123,26 @@ Results (criterion, `Compressed<f64>`; lossless bitwise):
 - `compression/decode_f64_n1000`: ~31.44 µs
 - `compression/encode_f64_n10000`: ~163.91 µs
 - `compression/decode_f64_n10000`: ~347.73 µs
+
+---
+
+## 2026-01-14 — planning bench (local, after strictness work)
+
+Date (UTC): 2026-01-14T11:19:05Z  
+Operator: codex-cli
+
+Machine:
+- CPU: Intel(R) Xeon(R) W-2295 CPU @ 3.00GHz (18c/36t)
+- RAM: 503Gi
+- OS: Linux 5.15.0-156-generic x86_64
+
+Command(s):
+- `cargo bench -p orsx --bench planning`
+
+Profile:
+- release (cargo bench)
+
+Results (criterion):
+- `planning/diff_schema_50_cols`: ~11.27 µs
+- `planning/diff_schema_200_cols`: ~44.56 µs
+- `planning/diff_schema_1000_cols`: ~219.48 µs

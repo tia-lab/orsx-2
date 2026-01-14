@@ -1,5 +1,5 @@
 use crate::migrations::config::MigrationConfig;
-use crate::migrations::introspection::TableSchema;
+use crate::migrations::introspection::{ColumnInfo, TableSchema};
 use crate::schema::TableSpec;
 use crate::{quote_identifier, Error, Result};
 use sqlx::PgPool;
@@ -40,10 +40,12 @@ pub async fn online_rewrite_table(
         .map_err(|_| Error::Other("system time error".to_string()))?
         .as_secs();
 
-    let shadow = format!("{table_name}__orsx2_shadow_{ts}");
-    let backup = format!("{table_name}__orsx2_backup_{ts}");
-    let trigger_fn = format!("{table_name}__orsx2_mirror_fn_{ts}");
-    let trigger_name = format!("{table_name}__orsx2_mirror_trg_{ts}");
+    // Derived object names must stay under Postgres' 63-byte identifier limit.
+    let shadow = derived_object_name(table_name, "shadow", ts);
+    let backup = derived_object_name(table_name, "backup", ts);
+    let changelog = derived_object_name(table_name, "changelog", ts);
+    let trigger_fn = derived_object_name(table_name, "mirror_fn", ts);
+    let trigger_name = derived_object_name(table_name, "mirror_trg", ts);
 
     // Phase 1: create shadow table with expected schema.
     let create_sql = {
@@ -79,13 +81,14 @@ pub async fn online_rewrite_table(
 
     sqlx::query(&create_sql).execute(pool).await?;
 
-    // Phase 2: create mirror trigger.
+    // Phase 2: create changelog table and trigger that records changed PKs.
+    create_changelog(pool, &changelog, current_pk).await?;
     create_mirror_trigger(
         pool,
         &trigger_fn,
         &trigger_name,
         table_name,
-        &shadow,
+        &changelog,
         pk.name,
         &col_exprs,
         current,
@@ -106,14 +109,33 @@ pub async fn online_rewrite_table(
     .await?;
     let backfill_ms = backfill_start.elapsed().as_millis() as u64;
 
-    // Phase 4: cutover (short lock): drop trigger, swap, cleanup.
+    // Phase 4: catch up changes by reading changelog and applying to the shadow table.
+    let catchup_start = Instant::now();
+    let catchup_drained = catch_up_best_effort(
+        pool,
+        table_name,
+        &shadow,
+        &changelog,
+        pk.name,
+        &current_pk.sql_type,
+        &col_exprs,
+        cfg,
+    )
+    .await?;
+    let catchup_ms = catchup_start.elapsed().as_millis() as u64;
+
+    // Phase 5: cutover (short lock): disable trigger, final drain, swap, cleanup.
     let cutover_stats = cutover(
         pool,
         table_name,
         &shadow,
         &backup,
+        &changelog,
         &trigger_name,
         &trigger_fn,
+        pk.name,
+        &current_pk.sql_type,
+        &col_exprs,
         cfg,
     )
     .await?;
@@ -133,6 +155,8 @@ pub async fn online_rewrite_table(
         total_ms = total_ms,
         backfill_ms = backfill_ms,
         backfill_rows = backfill_rows,
+        catchup_ms = catchup_ms,
+        catchup_drained_pk = catchup_drained,
         cutover_lock_ms = cutover_stats.lock_ms,
         "online rewrite completed"
     );
@@ -167,6 +191,22 @@ fn build_column_exprs(
             // Use OLD/NEW qualified name for triggers; backfill uses source alias `src`.
             // We'll substitute prefixes at call sites.
             quote_identifier(col.name)
+        } else if let Some(from) = col.rename_from {
+            if current_cols.contains(from) {
+                quote_identifier(from)
+            } else {
+                // Fall through to defaults/nullability rules.
+                if let Some(default_sql) = col.default_sql {
+                    default_sql.to_string()
+                } else if col.nullable {
+                    "NULL".to_string()
+                } else {
+                    return Err(Error::MigrationNeeded(format!(
+                        "new NOT NULL column '{}' requires default_sql for online rewrite",
+                        col.name
+                    )));
+                }
+            }
         } else if let Some(default_sql) = col.default_sql {
             default_sql.to_string()
         } else if col.nullable {
@@ -184,50 +224,26 @@ fn build_column_exprs(
     Ok(out)
 }
 
+async fn create_changelog(pool: &PgPool, changelog: &str, pk: &ColumnInfo) -> Result<()> {
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} (pk {} PRIMARY KEY)",
+        quote_identifier(changelog),
+        pk.sql_type
+    );
+    sqlx::query(&sql).execute(pool).await?;
+    Ok(())
+}
+
 async fn create_mirror_trigger(
     pool: &PgPool,
     trigger_fn: &str,
     trigger_name: &str,
     source_table: &str,
-    shadow_table: &str,
+    changelog: &str,
     pk_name: &'static str,
-    col_exprs: &[(&'static str, String)],
-    current: &TableSchema,
+    _col_exprs: &[(&'static str, String)],
+    _current: &TableSchema,
 ) -> Result<()> {
-    let current_cols: std::collections::HashSet<&str> =
-        current.columns.iter().map(|c| c.name.as_str()).collect();
-
-    // Build INSERT column list and values list for NEW (INSERT/UPDATE).
-    let columns = col_exprs
-        .iter()
-        .map(|(c, _)| quote_identifier(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let values_new = col_exprs
-        .iter()
-        .map(|(c, expr)| {
-            if current_cols.contains(c) {
-                format!("NEW.{}", quote_identifier(c))
-            } else if expr == "NULL" {
-                "NULL".to_string()
-            } else {
-                expr.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let set_parts = col_exprs
-        .iter()
-        .filter(|(c, _)| *c != pk_name)
-        .map(|(c, _)| {
-            let q = quote_identifier(c);
-            format!("{q} = EXCLUDED.{q}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
     let pk_q = quote_identifier(pk_name);
 
     let fn_sql = format!(
@@ -235,23 +251,20 @@ async fn create_mirror_trigger(
         CREATE OR REPLACE FUNCTION {fn_ident}() RETURNS trigger AS $$
         BEGIN
           IF (TG_OP = 'DELETE') THEN
-            DELETE FROM {shadow} WHERE {pk_q} = OLD.{pk_q};
+            INSERT INTO {changelog} (pk) VALUES (OLD.{pk_q})
+              ON CONFLICT (pk) DO NOTHING;
             RETURN OLD;
           ELSE
-            INSERT INTO {shadow} ({columns})
-              VALUES ({values_new})
-              {on_conflict};
+            INSERT INTO {changelog} (pk) VALUES (NEW.{pk_q})
+              ON CONFLICT (pk) DO NOTHING;
             RETURN NEW;
           END IF;
         END;
         $$ LANGUAGE plpgsql;
         "#,
         fn_ident = quote_identifier(trigger_fn),
-        shadow = quote_identifier(shadow_table),
+        changelog = quote_identifier(changelog),
         pk_q = pk_q,
-        columns = columns,
-        values_new = values_new,
-        on_conflict = on_conflict_clause(&pk_q, &set_parts),
     );
 
     sqlx::query(&fn_sql).execute(pool).await?;
@@ -310,11 +323,11 @@ async fn backfill(
     // Build SELECT list from source alias `src`.
     let values = col_exprs
         .iter()
-        .map(|(c, expr)| {
+        .map(|(_c, expr)| {
             if expr == "NULL" {
                 "NULL".to_string()
             } else if expr.starts_with('"') {
-                format!("src.{}", quote_identifier(c))
+                format!("src.{expr}")
             } else {
                 expr.clone()
             }
@@ -368,13 +381,100 @@ async fn backfill(
     Ok(total_rows)
 }
 
+async fn catch_up_best_effort(
+    pool: &PgPool,
+    source: &str,
+    shadow: &str,
+    changelog: &str,
+    pk: &'static str,
+    pk_sql_type: &str,
+    col_exprs: &[(&'static str, String)],
+    cfg: &MigrationConfig,
+) -> Result<u64> {
+    let pk_q = quote_identifier(pk);
+    let pk_cast = cast_type_for_param(pk_sql_type)?;
+    let columns = col_exprs
+        .iter()
+        .map(|(c, _)| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let values = col_exprs
+        .iter()
+        .map(|(_c, expr)| {
+            if expr == "NULL" {
+                "NULL".to_string()
+            } else if expr.starts_with('"') {
+                format!("src.{expr}")
+            } else {
+                expr.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let set_parts = col_exprs
+        .iter()
+        .filter(|(c, _)| *c != pk)
+        .map(|(c, _)| {
+            let q = quote_identifier(c);
+            format!("{q} = EXCLUDED.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut drained_total: u64 = 0;
+    for _round in 0..cfg.max_online_catchup_rounds {
+        let pks: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT pk::text FROM {} ORDER BY pk::text LIMIT $1",
+            quote_identifier(changelog)
+        ))
+        .bind(cfg.online_chunk_size)
+        .fetch_all(pool)
+        .await?;
+
+        if pks.is_empty() {
+            return Ok(drained_total);
+        }
+
+        let pk_values: Vec<String> = pks.into_iter().map(|t| t.0).collect();
+        drained_total = drained_total.saturating_add(pk_values.len() as u64);
+
+        apply_changelog_batch(
+            pool,
+            source,
+            shadow,
+            changelog,
+            &pk_values,
+            &pk_q,
+            pk_cast,
+            &columns,
+            &values,
+            &set_parts,
+        )
+        .await?;
+
+        if cfg.online_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(cfg.online_sleep_ms)).await;
+        }
+    }
+
+    // Under ongoing writes, changelog may not reach zero. This is expected; final drain
+    // happens inside cutover after triggers are disabled.
+    Ok(drained_total)
+}
+
 async fn cutover(
     pool: &PgPool,
     source: &str,
     shadow: &str,
     backup: &str,
+    changelog: &str,
     trigger_name: &str,
     trigger_fn: &str,
+    pk: &'static str,
+    pk_sql_type: &str,
+    col_exprs: &[(&'static str, String)],
     cfg: &MigrationConfig,
 ) -> Result<CutoverStats> {
     // Cutover lock.
@@ -388,7 +488,7 @@ async fn cutover(
     .execute(tx.as_mut())
     .await?;
 
-    // Drop the mirror trigger (no longer needed after swap).
+    // Drop the mirror trigger to stop recording changes.
     sqlx::query(&format!(
         "DROP TRIGGER IF EXISTS {} ON {}",
         quote_identifier(trigger_name),
@@ -397,10 +497,80 @@ async fn cutover(
     .execute(tx.as_mut())
     .await?;
 
-    // Drop trigger function.
-    sqlx::query(&format!("DROP FUNCTION IF EXISTS {}()", quote_identifier(trigger_fn)))
-        .execute(tx.as_mut())
+    // Final drain inside lock (trigger dropped, so it must converge).
+    let pk_q = quote_identifier(pk);
+    let pk_cast = cast_type_for_param(pk_sql_type)?;
+
+    let columns = col_exprs
+        .iter()
+        .map(|(c, _)| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let values = col_exprs
+        .iter()
+        .map(|(_c, expr)| {
+            if expr == "NULL" {
+                "NULL".to_string()
+            } else if expr.starts_with('"') {
+                format!("src.{expr}")
+            } else {
+                expr.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let set_parts = col_exprs
+        .iter()
+        .filter(|(c, _)| *c != pk)
+        .map(|(c, _)| {
+            let q = quote_identifier(c);
+            format!("{q} = EXCLUDED.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    for _round in 0..cfg.max_online_catchup_rounds {
+        let pks: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT pk::text FROM {} ORDER BY pk::text LIMIT $1",
+            quote_identifier(changelog)
+        ))
+        .bind(cfg.online_chunk_size)
+        .fetch_all(tx.as_mut())
         .await?;
+        if pks.is_empty() {
+            break;
+        }
+        let pk_values: Vec<String> = pks.into_iter().map(|t| t.0).collect();
+        apply_changelog_batch_tx(
+            &mut tx,
+            source,
+            shadow,
+            changelog,
+            &pk_values,
+            &pk_q,
+            pk_cast,
+            &columns,
+            &values,
+            &set_parts,
+        )
+        .await?;
+    }
+
+    // If still not empty, this violates the cutover safety contract.
+    let remaining: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*)::BIGINT FROM {}",
+        quote_identifier(changelog)
+    ))
+    .fetch_one(tx.as_mut())
+    .await?;
+    if remaining.0 != 0 {
+        return Err(Error::MigrationNeeded(format!(
+            "cutover drain did not converge; remaining changelog rows: {}",
+            remaining.0
+        )));
+    }
 
     // Swap names.
     sqlx::query(&format!(
@@ -419,6 +589,14 @@ async fn cutover(
     .execute(tx.as_mut())
     .await?;
 
+    // Cleanup trigger function and changelog table.
+    sqlx::query(&format!("DROP FUNCTION IF EXISTS {}()", quote_identifier(trigger_fn)))
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query(&format!("DROP TABLE IF EXISTS {}", quote_identifier(changelog)))
+        .execute(tx.as_mut())
+        .await?;
+
     tx.commit().await?;
 
     let elapsed = lock_start.elapsed();
@@ -432,6 +610,116 @@ async fn cutover(
     Ok(CutoverStats {
         lock_ms: elapsed.as_millis() as u64,
     })
+}
+
+async fn apply_changelog_batch(
+    pool: &PgPool,
+    source: &str,
+    shadow: &str,
+    changelog: &str,
+    pk_values: &[String],
+    pk_q: &str,
+    pk_cast: &str,
+    columns: &str,
+    values: &str,
+    set_parts: &str,
+) -> Result<()> {
+    let upsert = format!(
+        "INSERT INTO {shadow} ({columns}) \
+         SELECT {values} FROM {src} AS src \
+         WHERE {pk_q} = ANY($1::{pk_cast}[]) \
+         {on_conflict}",
+        shadow = quote_identifier(shadow),
+        src = quote_identifier(source),
+        pk_q = pk_q,
+        columns = columns,
+        values = values,
+        pk_cast = pk_cast,
+        on_conflict = on_conflict_clause(pk_q, set_parts),
+    );
+    sqlx::query(&upsert)
+        .bind(pk_values)
+        .execute(pool)
+        .await?;
+
+    let delete_missing = format!(
+        "DELETE FROM {shadow} s \
+         WHERE s.{pk_q} = ANY($1::{pk_cast}[]) \
+           AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
+        shadow = quote_identifier(shadow),
+        src = quote_identifier(source),
+        pk_q = pk_q,
+        pk_cast = pk_cast,
+    );
+    sqlx::query(&delete_missing)
+        .bind(pk_values)
+        .execute(pool)
+        .await?;
+
+    let clear = format!(
+        "DELETE FROM {} WHERE pk::text = ANY($1)",
+        quote_identifier(changelog)
+    );
+    sqlx::query(&clear)
+        .bind(pk_values)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn apply_changelog_batch_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source: &str,
+    shadow: &str,
+    changelog: &str,
+    pk_values: &[String],
+    pk_q: &str,
+    pk_cast: &str,
+    columns: &str,
+    values: &str,
+    set_parts: &str,
+) -> Result<()> {
+    let upsert = format!(
+        "INSERT INTO {shadow} ({columns}) \
+         SELECT {values} FROM {src} AS src \
+         WHERE {pk_q} = ANY($1::{pk_cast}[]) \
+         {on_conflict}",
+        shadow = quote_identifier(shadow),
+        src = quote_identifier(source),
+        pk_q = pk_q,
+        columns = columns,
+        values = values,
+        pk_cast = pk_cast,
+        on_conflict = on_conflict_clause(pk_q, set_parts),
+    );
+    sqlx::query(&upsert)
+        .bind(pk_values)
+        .execute(tx.as_mut())
+        .await?;
+
+    let delete_missing = format!(
+        "DELETE FROM {shadow} s \
+         WHERE s.{pk_q} = ANY($1::{pk_cast}[]) \
+           AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
+        shadow = quote_identifier(shadow),
+        src = quote_identifier(source),
+        pk_q = pk_q,
+        pk_cast = pk_cast,
+    );
+    sqlx::query(&delete_missing)
+        .bind(pk_values)
+        .execute(tx.as_mut())
+        .await?;
+
+    let clear = format!(
+        "DELETE FROM {} WHERE pk::text = ANY($1)",
+        quote_identifier(changelog)
+    );
+    sqlx::query(&clear)
+        .bind(pk_values)
+        .execute(tx.as_mut())
+        .await?;
+    Ok(())
 }
 
 fn cast_type_for_param(pk_sql_type: &str) -> Result<&'static str> {
@@ -452,6 +740,29 @@ fn on_conflict_clause(pk_q: &str, set_parts: &str) -> String {
     } else {
         format!("ON CONFLICT ({pk_q}) DO UPDATE SET {set_parts}")
     }
+}
+
+fn derived_object_name(base: &str, kind: &str, ts: u64) -> String {
+    // Keep suffix stable and readable.
+    let suffix = format!("__orsx2_{kind}_{ts}");
+    if base.len() + suffix.len() <= 63 {
+        return format!("{base}{suffix}");
+    }
+
+    // Shorten the base name while keeping uniqueness via a stable hash of the full base.
+    let hash = crc32fast::hash(base.as_bytes());
+    let hash_str = format!("{hash:08x}");
+    let suffix = format!("__orsx2_{kind}_{ts}_{hash_str}");
+
+    // Leave as much of the base as possible while staying under the limit.
+    let max_base_len = 63usize.saturating_sub(suffix.len());
+    let truncated = if base.len() <= max_base_len {
+        base.to_string()
+    } else {
+        // Identifiers are ASCII in our expected usage; truncate on char boundary anyway.
+        base.chars().take(max_base_len).collect::<String>()
+    };
+    format!("{truncated}{suffix}")
 }
 
 fn create_index_sql_concurrently(table_name: &str, index: &crate::IndexInfo) -> String {
