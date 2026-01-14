@@ -44,6 +44,7 @@ The columnar system provides:
   - Contract: the query must be syntactically wrapped into COPY; caller is responsible for stable column order.
 - **Fallback path (allowed)**: row-wise decode (`sqlx::Row`) into columns.
   - Contract: correctness-first; used for portability/debugging; not the performance target.
+- **Auto (recommended)**: choose COPY vs row-wise by expected shape (columns + expected rows) while always outputting the same `ColumnarBatch`.
 
 ## 4) Public API contract (mandatory)
 

@@ -1,8 +1,11 @@
 use crate::{Error, Result};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 use sqlx::postgres::PgConnection;
+use sqlx::postgres::PgRow;
+use sqlx::Row;
 // NOTE: We intentionally use a single contiguous buffer for COPY BINARY parsing to
 // minimize per-field overhead on wide tables.
 
@@ -596,6 +599,22 @@ impl ColumnarBatch {
         }
     }
 
+    pub fn push_i16(&mut self, col_idx: usize, v: i16) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedI16 { values, .. } => {
+                values.push(v);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected I16 column".to_string())),
+        }
+    }
+
     pub fn push_i32(&mut self, col_idx: usize, v: i32) -> Result<()> {
         let row_idx = self.row_count;
         let col = self
@@ -609,6 +628,22 @@ impl ColumnarBatch {
                 Ok(())
             }
             _ => Err(Error::Other("expected I32 column".to_string())),
+        }
+    }
+
+    pub fn push_f32_bits(&mut self, col_idx: usize, bits: u32) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedF32Bits { values, .. } => {
+                values.push(bits);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected F32 column".to_string())),
         }
     }
 
@@ -1160,5 +1195,235 @@ impl<'c> CopyBinaryBatchReader<'c> {
         self.buf.copy_within(self.pos.., 0);
         self.buf.truncate(remaining);
         self.pos = 0;
+    }
+}
+
+pub struct RowWiseBatchReader<'c> {
+    rows: BoxStream<'c, std::result::Result<PgRow, sqlx::Error>>,
+    schema: ColumnarSchema,
+    done: bool,
+}
+
+impl<'c> RowWiseBatchReader<'c> {
+    pub async fn new_select_unchecked(
+        conn: &'c mut PgConnection,
+        select_sql: &'c str,
+        schema: ColumnarSchema,
+    ) -> Result<Self> {
+        if schema.is_empty() {
+            return Err(Error::Other("schema must not be empty".to_string()));
+        }
+        let rows = sqlx::query(select_sql).fetch(conn).boxed();
+        Ok(Self {
+            rows,
+            schema,
+            done: false,
+        })
+    }
+
+    pub fn schema(&self) -> &ColumnarSchema {
+        &self.schema
+    }
+
+    pub async fn next_batch_into(&mut self, out: &mut ColumnarBatch) -> Result<usize> {
+        if &self.schema != out.schema() {
+            return Err(Error::Other(
+                "output batch schema does not match reader schema".to_string(),
+            ));
+        }
+        if self.done {
+            out.prepare(out.row_capacity())?;
+            return Ok(0);
+        }
+
+        out.prepare(out.row_capacity())?;
+
+        while out.row_count() < out.row_capacity() {
+            let row = match self.rows.try_next().await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    self.done = true;
+                    break;
+                }
+                Err(e) => return Err(Error::Database(e)),
+            };
+
+            for (col_idx, f) in self.schema.fields().iter().enumerate() {
+                match f.ty {
+                    ColumnarType::Bool => {
+                        let v: Option<bool> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_bool(col_idx, v)?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::I16 => {
+                        let v: Option<i16> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_i16(col_idx, v)?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::I32 => {
+                        let v: Option<i32> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_i32(col_idx, v)?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::I64 => {
+                        let v: Option<i64> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_i64(col_idx, v)?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::F32 => {
+                        let v: Option<f32> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => {
+                                out.push_f32_bits(col_idx, v.to_bits())?;
+                            }
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::F64 => {
+                        let v: Option<f64> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_f64_bits(col_idx, v.to_bits())?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::Uuid => {
+                        let v: Option<sqlx::types::Uuid> =
+                            row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_uuid_bytes(col_idx, *v.as_bytes())?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::TimestampTzMicros => {
+                        let v: Option<crate::SqlxTimestamp> =
+                            row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_timestamp_micros(
+                                col_idx,
+                                v.to_jiff().as_microsecond(),
+                            )?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::Utf8 => {
+                        let v: Option<&str> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_utf8(col_idx, v)?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                    ColumnarType::Bytes => {
+                        let v: Option<&[u8]> = row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_var_bytes(col_idx, v)?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
+                }
+            }
+
+            out.end_row()?;
+        }
+
+        Ok(out.row_count())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnarAutoConfig {
+    pub expected_rows: Option<usize>,
+    pub cols_force_copy_min: usize,
+    pub cols_force_row_wise_max: usize,
+    pub rows_force_row_wise_min: usize,
+}
+
+impl Default for ColumnarAutoConfig {
+    fn default() -> Self {
+        Self {
+            expected_rows: None,
+            cols_force_copy_min: 128,
+            cols_force_row_wise_max: 64,
+            rows_force_row_wise_min: 500_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ColumnarReaderMode {
+    CopyBinary,
+    RowWise,
+    Auto(ColumnarAutoConfig),
+}
+
+impl Default for ColumnarReaderMode {
+    fn default() -> Self {
+        Self::Auto(ColumnarAutoConfig::default())
+    }
+}
+
+pub enum ColumnarBatchReader<'c> {
+    Copy(CopyBinaryBatchReader<'c>),
+    RowWise(RowWiseBatchReader<'c>),
+}
+
+impl<'c> ColumnarBatchReader<'c> {
+    pub async fn new_select_unchecked(
+        conn: &'c mut PgConnection,
+        select_sql: &'c str,
+        schema: ColumnarSchema,
+        mode: ColumnarReaderMode,
+    ) -> Result<Self> {
+        enum Chosen {
+            CopyBinary,
+            RowWise,
+        }
+        let chosen = match mode {
+            ColumnarReaderMode::CopyBinary => Chosen::CopyBinary,
+            ColumnarReaderMode::RowWise => Chosen::RowWise,
+            ColumnarReaderMode::Auto(cfg) => {
+                let cols = schema.len();
+                let expected_rows = cfg.expected_rows.unwrap_or(0);
+                if cols >= cfg.cols_force_copy_min {
+                    Chosen::CopyBinary
+                } else if expected_rows >= cfg.rows_force_row_wise_min
+                    && cols <= cfg.cols_force_row_wise_max
+                {
+                    Chosen::RowWise
+                } else {
+                    Chosen::CopyBinary
+                }
+            }
+        };
+
+        match chosen {
+            Chosen::CopyBinary => Ok(Self::Copy(
+                CopyBinaryBatchReader::new_select_unchecked(conn, select_sql, schema).await?,
+            )),
+            Chosen::RowWise => Ok(Self::RowWise(
+                RowWiseBatchReader::new_select_unchecked(conn, select_sql, schema).await?,
+            )),
+        }
+    }
+
+    pub fn schema(&self) -> &ColumnarSchema {
+        match self {
+            ColumnarBatchReader::Copy(r) => r.schema(),
+            ColumnarBatchReader::RowWise(r) => r.schema(),
+        }
+    }
+
+    pub async fn next_batch_into(&mut self, out: &mut ColumnarBatch) -> Result<usize> {
+        match self {
+            ColumnarBatchReader::Copy(r) => r.next_batch_into(out).await,
+            ColumnarBatchReader::RowWise(r) => r.next_batch_into(out).await,
+        }
     }
 }
