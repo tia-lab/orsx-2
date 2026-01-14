@@ -13,7 +13,7 @@ Applies to: `orsx2::types::Compressed<T>`
 
 - Integers:
 - Floats:
-- Maximum length:
+- Maximum length: 1,000,000 elements (rare; must remain safe)
 
 ## 3) Envelope format (mandatory, versioned)
 
@@ -45,8 +45,8 @@ All must return deterministic errors and must not panic.
 
 ## 6) Performance budgets
 
-- Encode throughput target (MB/s) at representative sizes:
-- Decode throughput target (MB/s) at representative sizes:
+- Encode throughput target (MB/s) at representative sizes: >= 200 MB/s at 10k elements
+- Decode throughput target (MB/s) at representative sizes: >= 200 MB/s at 10k elements
 - Allocation policy (caller-owned buffers?):
 
 ## 6.1 Workspace / zero-copy API plan (mandatory)

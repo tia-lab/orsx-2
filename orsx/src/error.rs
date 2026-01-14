@@ -5,9 +5,11 @@ pub enum Error {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    #[error("Migration required but not implemented: {0}")]
+    MigrationNeeded(String),
+
     #[error("{0}")]
     Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-

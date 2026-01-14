@@ -12,11 +12,12 @@ Applies to: `orsx2` crate
 
 ## 2) Inputs and bounds (mandatory)
 
-- Postgres versions supported:
-- Table size bounds (rows, row width):
-- Index expectations:
-- Max acceptable cutover lock time:
-- Write traffic during migration (allowed / not allowed):
+- Postgres versions supported: 16..17
+- Table size bounds (rows, row width): up to 1e8 rows; 200..2000 bytes/row
+- Index expectations: 5..30 indexes typical; btree common; gin possible
+- Max acceptable cutover lock time: 5 seconds
+- Write traffic during migration (allowed / not allowed): allowed; must continue
+- Triggers allowed during migration: yes (required for online path)
 
 ## 3) Supported change set (must be explicit)
 
@@ -41,11 +42,13 @@ For each item below, mark one: **SUPPORTED (offline)** / **SUPPORTED (online)** 
 Define deterministic rules to choose a migration strategy:
 
 - Small table threshold(s):
+  - default: up to 1,000,000 rows → offline may be allowed (configurable)
 - Large table threshold(s):
+  - above threshold → online migration required for any rewrite-class change
 - Online migration prerequisites:
-  - required PK/index
-  - required ability to dual-write or use triggers
-  - requirements on application write behavior (if any)
+  - stable primary key or unique key suitable for chunked backfill
+  - triggers permitted (or explicit app dual-write contract)
+  - ability to run backfill batches without exceeding lock budget
 
 ## 5) Algorithms (must be auditable)
 
@@ -64,8 +67,8 @@ Define:
 Define:
 
 - Shadow table creation
-- Dual-write mechanism (if any): triggers or application-side
-- Backfill batching plan (chunk size, ordering, retry policy)
+- Dual-write mechanism (if any): triggers preferred (default); app dual-write optional
+- Backfill batching plan (chunk size, ordering, retry policy): deterministic chunking by PK order; retry with backoff; throttleable
 - Verification and reconciliation
 - Cutover sequence (minimal lock)
 - Failure recovery and resumability
@@ -91,10 +94,10 @@ List deterministic error variants and when they occur.
 
 Define:
 
-- planning budget at N columns / M indexes:
-- offline migration budget thresholds:
-- online migration backfill throughput targets:
-- cutover lock budget:
+- planning budget at N columns / M indexes: <= 50ms at 1,000 columns and 200 indexes (target)
+- offline migration budget thresholds: only for <= 1,000,000 rows by default; configurable
+- online migration backfill throughput targets: >= 50k rows/sec typical; throttleable
+- cutover lock budget: <= 5 seconds
 
 ## 9.1 Workspace / allocation plan (mandatory)
 

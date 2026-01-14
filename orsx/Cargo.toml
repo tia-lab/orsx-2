@@ -16,3 +16,10 @@ async-trait = { workspace = true }
 
 orsx-macros = { path = "../orsx-macros" }
 
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "planning"
+harness = false

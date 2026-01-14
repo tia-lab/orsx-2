@@ -42,6 +42,7 @@ Legacy protocol/examples used as style reference (do not copy their legal header
 - **No SQL injection**: never concatenate untrusted strings into SQL without strict identifier quoting.
 - **No panics in library code**: avoid `unwrap/expect/panic/todo/unreachable` outside tests/benches.
 - **Determinism**: same inputs + schema should produce the same migration plan and SQL (ignoring timestamps in backup names).
+- **No git operations**: never run `git` commands or modify git state (no commits/branches/tags/resets) unless you explicitly ask.
 
 ## Code standards (mandatory)
 

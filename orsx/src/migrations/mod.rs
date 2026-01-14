@@ -1,0 +1,82 @@
+use crate::{Error, OrsxMigrate, Result};
+use sqlx::PgPool;
+use std::time::Instant;
+
+pub mod introspection;
+pub mod planning;
+
+pub struct Migrations;
+
+impl Migrations {
+    pub async fn init<T: OrsxMigrate>(
+        pool: &PgPool,
+        migrations: &[(T, Option<&str>)],
+    ) -> Result<()> {
+        for (_instance, custom_name) in migrations {
+            let spec = T::spec();
+            let table_name = custom_name.unwrap_or(spec.table_name);
+
+            if !introspection::table_exists(pool, table_name).await? {
+                let start = Instant::now();
+                let create_sql = T::create_table_sql(Some(table_name));
+                sqlx::query(&create_sql).execute(pool).await?;
+
+                // Create indexes (best-effort; deterministic SQL).
+                for idx in spec.indexes {
+                    let sql = planning::create_index_sql(table_name, idx);
+                    sqlx::query(&sql).execute(pool).await?;
+                }
+
+                tracing::info!(
+                    table = table_name,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "created table"
+                );
+                continue;
+            }
+
+            let start = Instant::now();
+            let expected = planning::expected_schema_from_spec(table_name, &spec);
+
+            // Fast-path, non-rewrite migrations (must remain safe at scale).
+            // Iterate because some safe operations (e.g. ADD COLUMN) can reveal
+            // follow-up diffs (e.g. add uniqueness) that are also safe.
+            let mut iterations = 0u8;
+            loop {
+                iterations = iterations.saturating_add(1);
+                if iterations > 5 {
+                    break;
+                }
+
+                let current = introspection::read_table_schema(pool, table_name).await?;
+                let diff = planning::filter_ignored_diffs(planning::diff_schema(&current, &expected));
+                if diff.is_empty() {
+                    break;
+                }
+
+                planning::apply_safe_alters(pool, table_name, &spec, &current, &expected, &diff)
+                    .await?;
+            }
+
+            let after = introspection::read_table_schema(pool, table_name).await?;
+            let after_diff =
+                planning::filter_ignored_diffs(planning::diff_schema(&after, &expected));
+
+            if !after_diff.is_empty() {
+                return Err(Error::MigrationNeeded(format!(
+                    "table {table_name} needs migration: {} change(s) detected: {:?}",
+                    after_diff.len(),
+                    after_diff
+                )));
+            }
+
+            tracing::info!(
+                table = table_name,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "applied safe alters"
+            );
+        }
+
+        Ok(())
+    }
+}
