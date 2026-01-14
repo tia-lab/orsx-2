@@ -183,3 +183,57 @@ Command(s):
 
 Outcome:
 - Success/failure: success (4 tests)
+
+---
+
+## Perf compare: default vs strict enforcement (200k rows, release)
+
+Date (UTC): 2026-01-14T11:40:00Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 200,000
+- Columns: UUID PK + 49 `INTEGER NOT NULL` + new `new_nullable INTEGER NULL`
+- Setup: base table created with wrong physical order (c02 before c01) and missing `new_nullable`
+
+Configs compared:
+- Default: `enforce_column_order=false`, `enforce_exact_columns=false` (safe alter path)
+- Strict: `enforce_column_order=true`, `enforce_exact_columns=true`, `allow_destructive_drops=true` (forces online rewrite due to order mismatch)
+
+Command(s):
+- `ORSX_BIG_ROWS=200000 cargo test -p orsx --release --test migrations_big_strict_compare -- --ignored --nocapture`
+
+Outcome:
+- Default: seed ~2.45s, migrate ~30.9ms (ALTER TABLE ADD COLUMN)
+- Strict: seed ~2.56s, migrate ~2.75s (online rewrite to fix order)
+
+---
+
+## Perf compare: default vs strict enforcement (1M rows, release)
+
+Date (UTC): 2026-01-14T11:45:05Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 1,000,000
+- Columns: UUID PK + 49 `INTEGER NOT NULL` + new `new_nullable INTEGER NULL`
+- Setup: base table created with wrong physical order (c02 before c01) and missing `new_nullable`
+
+Configs compared:
+- Default: `enforce_column_order=false`, `enforce_exact_columns=false` (safe alter path)
+- Strict: `enforce_column_order=true`, `enforce_exact_columns=true`, `allow_destructive_drops=true` (forces online rewrite due to order mismatch)
+
+Command(s):
+- `ORSX_BIG_ROWS=1000000 cargo test -p orsx --release --test migrations_big_strict_compare -- --ignored --nocapture`
+
+Outcome:
+- Default: seed ~12.64s, migrate ~28.6ms (ALTER TABLE ADD COLUMN)
+- Strict: seed ~12.08s, migrate ~16.97s (online rewrite to fix order)
