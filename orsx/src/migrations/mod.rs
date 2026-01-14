@@ -2,7 +2,9 @@ use crate::{Error, OrsxMigrate, Result};
 use sqlx::PgPool;
 use std::time::Instant;
 
+pub mod config;
 pub mod introspection;
+pub mod online;
 pub mod planning;
 
 pub struct Migrations;
@@ -11,6 +13,14 @@ impl Migrations {
     pub async fn init<T: OrsxMigrate>(
         pool: &PgPool,
         migrations: &[(T, Option<&str>)],
+    ) -> Result<()> {
+        Self::init_with_config::<T>(pool, migrations, &config::MigrationConfig::default()).await
+    }
+
+    pub async fn init_with_config<T: OrsxMigrate>(
+        pool: &PgPool,
+        migrations: &[(T, Option<&str>)],
+        cfg: &config::MigrationConfig,
     ) -> Result<()> {
         for (_instance, custom_name) in migrations {
             let spec = T::spec();
@@ -63,11 +73,19 @@ impl Migrations {
                 planning::filter_ignored_diffs(planning::diff_schema(&after, &expected));
 
             if !after_diff.is_empty() {
-                return Err(Error::MigrationNeeded(format!(
-                    "table {table_name} needs migration: {} change(s) detected: {:?}",
-                    after_diff.len(),
-                    after_diff
-                )));
+                // Online rewrite path for remaining diffs (large-table safe).
+                online::online_rewrite_table(pool, table_name, &spec, &after, &expected, cfg).await?;
+
+                let final_schema = introspection::read_table_schema(pool, table_name).await?;
+                let final_diff = planning::filter_ignored_diffs(planning::diff_schema(
+                    &final_schema,
+                    &expected,
+                ));
+                if !final_diff.is_empty() {
+                    return Err(Error::MigrationNeeded(format!(
+                        "table {table_name} still differs after online rewrite: {final_diff:?}"
+                    )));
+                }
             }
 
             tracing::info!(

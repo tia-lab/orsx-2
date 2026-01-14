@@ -7,6 +7,7 @@ pub struct ColumnSpec {
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
+    pub default_sql: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,11 @@ pub trait OrsxMigrate: Send + Sync {
                 col.ty.to_sql()
             );
 
+            if let Some(default_sql) = col.default_sql {
+                line.push_str(" DEFAULT ");
+                line.push_str(default_sql);
+            }
+
             if col.primary_key {
                 line.push_str(" PRIMARY KEY");
             }
@@ -56,4 +62,3 @@ pub trait OrsxMigrate: Send + Sync {
         )
     }
 }
-

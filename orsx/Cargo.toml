@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+cydec = { workspace = true }
+crc32fast = "1.5"
 
 orsx-macros = { path = "../orsx-macros" }
 
@@ -22,4 +24,8 @@ criterion = { workspace = true }
 
 [[bench]]
 name = "planning"
+harness = false
+
+[[bench]]
+name = "compression"
 harness = false

@@ -15,6 +15,7 @@ fn make_spec(cols: usize) -> TableSpec {
             nullable: true,
             primary_key: i == 0,
             unique: false,
+            default_sql: None,
         });
     }
     let cols_static: &'static [ColumnSpec] = Box::leak(v.into_boxed_slice());
@@ -77,4 +78,3 @@ fn bench_planning(c: &mut Criterion) {
 
 criterion_group!(benches, bench_planning);
 criterion_main!(benches);
-

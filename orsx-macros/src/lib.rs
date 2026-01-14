@@ -1,7 +1,8 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse_macro_input, Data, DeriveInput, Fields, GenericArgument, LitStr, Meta, PathArguments, Type,
+    parse_macro_input, Data, DeriveInput, Fields, GenericArgument, LitStr, Meta, PathArguments,
+    Type,
 };
 
 #[proc_macro_derive(OrsxMigrate, attributes(orsx_table, orsx_column))]
@@ -28,6 +29,7 @@ pub fn derive_orsx_migrate(input: TokenStream) -> TokenStream {
 
                 let is_pk = has_flag(&field.attrs, "primary_key");
                 let is_unique = has_flag(&field.attrs, "unique");
+                let default_sql = parse_default_sql(&field.attrs);
 
                 columns.push(quote! {
                     orsx::ColumnSpec {
@@ -36,6 +38,7 @@ pub fn derive_orsx_migrate(input: TokenStream) -> TokenStream {
                         nullable: #nullable,
                         primary_key: #is_pk,
                         unique: #is_unique,
+                        default_sql: #default_sql,
                     }
                 });
 
@@ -202,4 +205,24 @@ fn parse_index(
         });
     }
     None
+}
+
+fn parse_default_sql(attrs: &[syn::Attribute]) -> proc_macro2::TokenStream {
+    for attr in attrs {
+        if !attr.path().is_ident("orsx_column") {
+            continue;
+        }
+        let mut found: Option<String> = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default_sql") {
+                let v: LitStr = meta.value()?.parse()?;
+                found = Some(v.value());
+            }
+            Ok(())
+        });
+        if let Some(v) = found {
+            return quote! { Some(#v) };
+        }
+    }
+    quote! { None }
 }

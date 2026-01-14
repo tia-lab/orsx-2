@@ -155,9 +155,8 @@ pub async fn apply_safe_alters(
 
                 // Only allow adding nullable columns or columns with no NOT NULL requirement.
                 if !spec.nullable && !spec.is_primary_key {
-                    return Err(crate::Error::MigrationNeeded(format!(
-                        "adding NOT NULL column '{col}' requires rewrite/validation; not implemented"
-                    )));
+                    // Not safe as an ALTER for big tables; leave for online/offline rewrite path.
+                    continue;
                 }
 
                 let sql = format!(
@@ -172,9 +171,8 @@ pub async fn apply_safe_alters(
             SchemaDiff::NullabilityChanged { column, from, to } => {
                 // Allow loosening nullability (DROP NOT NULL). Tightening requires scan/validation.
                 if from && !to {
-                    return Err(crate::Error::MigrationNeeded(format!(
-                        "tightening nullability for '{column}' requires validation; not implemented"
-                    )));
+                    // Not safe without explicit validation; leave for rewrite path.
+                    continue;
                 }
                 if !from && to {
                     let sql = format!(
@@ -215,9 +213,8 @@ pub async fn apply_safe_alters(
             SchemaDiff::ColumnRemoved(_)
             | SchemaDiff::TypeChanged { .. }
             | SchemaDiff::PositionChanged { .. } => {
-                return Err(crate::Error::MigrationNeeded(format!(
-                    "unsupported schema change detected: {diff:?}"
-                )));
+                // Leave for rewrite path.
+                continue;
             }
         }
     }
