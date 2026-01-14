@@ -21,6 +21,16 @@ pub struct MigrationConfig {
     pub online_chunk_size_max: i64,
     pub online_target_batch_ms: u64,
     pub online_max_batch_ms: u64,
+
+    /// Opt-in: set `synchronous_commit=off` for backfill/catch-up sessions.
+    /// This can improve throughput on latency-bound storage but trades away per-transaction durability
+    /// during those phases. Cutover still enforces correctness and uses an explicit lock budget.
+    pub synchronous_commit_off: bool,
+
+    /// Opt-in: parallelize backfill for BIGINT PK tables (copy phase only).
+    /// Default path remains single-threaded and deterministic.
+    pub parallel_backfill: bool,
+    pub parallel_backfill_workers: usize,
 }
 
 impl Default for MigrationConfig {
@@ -40,6 +50,9 @@ impl Default for MigrationConfig {
             online_chunk_size_max: 200_000,
             online_target_batch_ms: 250,
             online_max_batch_ms: 2_000,
+            synchronous_commit_off: false,
+            parallel_backfill: false,
+            parallel_backfill_workers: 4,
         }
     }
 }

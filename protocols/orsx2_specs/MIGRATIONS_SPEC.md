@@ -162,9 +162,10 @@ High-impact improvements (in priority order):
 
 1. Typed changelog + typed ordering (no `ORDER BY pk::text`)
 2. Range-based catch-up (avoid `ANY($1::uuid[])` lists)
-3. Adaptive chunk sizing (opt-in)
-4. Optional session tuning: `synchronous_commit=off` during backfill/catch-up (opt-in)
-5. Parallel backfill (opt-in; numeric PK first; UUID partitioning deferred)
+3. Reduce per-round DB round-trips (fuse boundary selection + apply + clear without heavy `RETURNING`)
+4. Adaptive chunk sizing (opt-in)
+5. Optional session tuning: `synchronous_commit=off` during backfill/catch-up (opt-in)
+6. Parallel backfill (opt-in; numeric PK first; UUID partitioning deferred)
 
 Each item must include:
 - correctness test(s)

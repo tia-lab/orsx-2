@@ -350,3 +350,24 @@ Outcome:
 - Adaptive on:
   - online rewrite telemetry: total_ms ~3130, backfill_ms ~1948 (backfill_rows ~245000), catchup_ms ~1087 (drained_pk ~95000), cutover_lock_ms ~20
   - migrations wrapper total: ~3.21s; writer summary inserted=50000 updated=50000 deleted=50000; final rowcount=200000
+
+---
+
+## Online rewrite: 200k UUID PK with inserts+updates+deletes (release, after backfill keyset CTE)
+
+Date (UTC): 2026-01-14T12:31:20Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Command(s):
+- `RUST_LOG=info ORSX_BIG_ROWS=200000 ORSX_BIG_WRITER_ROWS=50000 ORSX_BIG_WRITER_BATCH=5000 ORSX_BIG_UPDATE_ROWS=50000 ORSX_BIG_UPDATE_BATCH=5000 ORSX_BIG_DELETE_ROWS=50000 ORSX_BIG_DELETE_BATCH=5000 ORSX_ADAPTIVE_CHUNK=0 cargo test -p orsx --release --test migrations_online_big_uuid -- --ignored --nocapture`
+
+Outcome:
+- Success/failure: success
+- online rewrite telemetry: total_ms ~3406, backfill_ms ~1996 (backfill_rows ~245000), catchup_ms ~1307 (drained_pk ~95000), cutover_lock_ms ~38
+
+Notes:
+- A “single-statement catch-up” attempt using `WITH moved ... DELETE ... RETURNING` regressed catch-up time and was reverted; range-based catch-up remains the fast path.

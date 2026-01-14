@@ -2,12 +2,45 @@ use crate::migrations::config::MigrationConfig;
 use crate::migrations::introspection::{ColumnInfo, TableSchema};
 use crate::schema::TableSpec;
 use crate::{quote_identifier, Error, Result};
+use futures::future::try_join_all;
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 struct CutoverStats {
     lock_ms: u64,
+}
+
+async fn with_synchronous_commit<'a, F, Fut, T>(
+    pool: &'a PgPool,
+    cfg: &MigrationConfig,
+    f: F,
+) -> Result<T>
+where
+    F: FnOnce(&'a mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut conn = pool.acquire().await?;
+    if !cfg.synchronous_commit_off {
+        return f(&mut conn).await;
+    }
+
+    let prev: String = sqlx::query_scalar("SHOW synchronous_commit")
+        .fetch_one(&mut *conn)
+        .await?;
+    sqlx::query("SET synchronous_commit TO off")
+        .execute(&mut *conn)
+        .await?;
+
+    let out = f(&mut conn).await;
+
+    // Best-effort restore to avoid leaking session settings back into the pool.
+    let _ = sqlx::query("SET synchronous_commit TO $1")
+        .bind(prev)
+        .execute(&mut *conn)
+        .await;
+
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,30 +205,35 @@ pub async fn online_rewrite_table(
 
     // Phase 3: backfill in chunks while triggers mirror live writes.
     let backfill_start = Instant::now();
-    let backfill_rows = backfill(
-        pool,
-        table_name,
-        &shadow,
-        pk.name,
-        &current_pk.sql_type,
-        &col_exprs,
-        cfg,
-    )
+    let backfill_rows = with_synchronous_commit(pool, cfg, |conn| {
+        backfill(
+            pool,
+            conn,
+            table_name,
+            &shadow,
+            pk.name,
+            &current_pk.sql_type,
+            &col_exprs,
+            cfg,
+        )
+    })
     .await?;
     let backfill_ms = backfill_start.elapsed().as_millis() as u64;
 
     // Phase 4: catch up changes by reading changelog and applying to the shadow table.
     let catchup_start = Instant::now();
-    let catchup_drained = catch_up_best_effort(
-        pool,
-        table_name,
-        &shadow,
-        &changelog,
-        pk.name,
-        &current_pk.sql_type,
-        &col_exprs,
-        cfg,
-    )
+    let catchup_drained = with_synchronous_commit(pool, cfg, |conn| {
+        catch_up_best_effort(
+            conn,
+            table_name,
+            &shadow,
+            &changelog,
+            pk.name,
+            &current_pk.sql_type,
+            &col_exprs,
+            cfg,
+        )
+    })
     .await?;
     let catchup_ms = catchup_start.elapsed().as_millis() as u64;
 
@@ -364,6 +402,7 @@ async fn create_mirror_trigger(
 
 async fn backfill(
     pool: &PgPool,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     source: &str,
     shadow: &str,
     pk: &'static str,
@@ -374,24 +413,21 @@ async fn backfill(
     let pk_q = quote_identifier(pk);
     let pk_cast = cast_type_for_param(pk_sql_type)?;
 
+    if cfg.parallel_backfill && is_parallel_backfill_pk(pk_sql_type) {
+        return parallel_backfill_bigint(
+            pool,
+            source,
+            shadow,
+            pk,
+            pk_sql_type,
+            col_exprs,
+            cfg,
+        )
+        .await;
+    }
+
     let mut total_rows: u64 = 0;
     let mut last_pk: Option<String> = None;
-
-    // Determine the batch boundary (max pk) using an index-friendly subquery, then copy the whole range.
-    // This avoids allocating large PK arrays and reduces round-trips/CPU overhead at scale.
-    // UUIDs are orderable (btree) but do not support MAX(uuid) aggregate in Postgres.
-    // Use ORDER BY DESC LIMIT 1 instead.
-    let select_last_initial = format!(
-        "SELECT {pk_q}::text FROM (SELECT {pk_q} FROM {src} ORDER BY {pk_q} LIMIT $1) s ORDER BY {pk_q} DESC LIMIT 1",
-        pk_q = pk_q,
-        src = quote_identifier(source),
-    );
-    let select_last_next = format!(
-        "SELECT {pk_q}::text FROM (SELECT {pk_q} FROM {src} WHERE {pk_q} > ($1::{pk_cast}) ORDER BY {pk_q} LIMIT $2) s ORDER BY {pk_q} DESC LIMIT 1",
-        pk_q = pk_q,
-        src = quote_identifier(source),
-        pk_cast = pk_cast,
-    );
 
     let columns = col_exprs
         .iter()
@@ -399,44 +435,73 @@ async fn backfill(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Build SELECT list from source alias `src`.
-    let values = col_exprs
+    // Build SELECT list from source alias `src`, with deterministic aliases matching target columns.
+    let moved_select = col_exprs
         .iter()
-        .map(|(_c, expr)| {
-            if expr == "NULL" {
+        .map(|(c, expr)| {
+            let expr_sql = if expr == "NULL" {
                 "NULL".to_string()
             } else if expr.starts_with('"') {
                 format!("src.{expr}")
             } else {
                 expr.clone()
-            }
+            };
+            format!("{expr_sql} AS {}", quote_identifier(c))
         })
         .collect::<Vec<_>>()
         .join(", ");
 
-    let insert_initial = format!(
-        "INSERT INTO {shadow} ({columns}) \
-         SELECT {values} FROM {src} AS src \
-         WHERE src.{pk_q} <= ($1::{pk_cast}) \
-         ON CONFLICT ({pk_q}) DO NOTHING",
-        shadow = quote_identifier(shadow),
+    // Single round-trip per batch:
+    // - pick the next chunk using keyset pagination on the PK index
+    // - insert from the materialized chunk
+    // - return the last PK as text + moved rowcount
+    let backfill_initial = format!(
+        r#"
+        WITH moved AS MATERIALIZED (
+          SELECT {moved_select}
+          FROM {src} AS src
+          ORDER BY src.{pk_q}
+          LIMIT $1
+        ),
+        _ins AS (
+          INSERT INTO {shadow} ({columns})
+          SELECT {columns} FROM moved
+          ON CONFLICT ({pk_q}) DO NOTHING
+        )
+        SELECT
+          (SELECT {pk_q}::text FROM moved ORDER BY {pk_q} DESC LIMIT 1) AS last_pk,
+          (SELECT COUNT(*)::bigint FROM moved) AS moved_rows
+        "#,
+        moved_select = moved_select,
         src = quote_identifier(source),
-        pk_q = pk_q,
+        shadow = quote_identifier(shadow),
         columns = columns,
-        values = values,
-        pk_cast = pk_cast,
+        pk_q = pk_q,
     );
 
-    let insert_range = format!(
-        "INSERT INTO {shadow} ({columns}) \
-         SELECT {values} FROM {src} AS src \
-         WHERE src.{pk_q} > ($1::{pk_cast}) AND src.{pk_q} <= ($2::{pk_cast}) \
-         ON CONFLICT ({pk_q}) DO NOTHING",
-        shadow = quote_identifier(shadow),
+    let backfill_next = format!(
+        r#"
+        WITH moved AS MATERIALIZED (
+          SELECT {moved_select}
+          FROM {src} AS src
+          WHERE src.{pk_q} > ($1::{pk_cast})
+          ORDER BY src.{pk_q}
+          LIMIT $2
+        ),
+        _ins AS (
+          INSERT INTO {shadow} ({columns})
+          SELECT {columns} FROM moved
+          ON CONFLICT ({pk_q}) DO NOTHING
+        )
+        SELECT
+          (SELECT {pk_q}::text FROM moved ORDER BY {pk_q} DESC LIMIT 1) AS last_pk,
+          (SELECT COUNT(*)::bigint FROM moved) AS moved_rows
+        "#,
+        moved_select = moved_select,
         src = quote_identifier(source),
-        pk_q = pk_q,
+        shadow = quote_identifier(shadow),
         columns = columns,
-        values = values,
+        pk_q = pk_q,
         pk_cast = pk_cast,
     );
 
@@ -444,43 +509,26 @@ async fn backfill(
     // Keeping a fixed chunk size avoids oscillation and makes perf easier to reason about.
     let chunk_size = cfg.online_chunk_size.max(1);
     loop {
-        let next_last: Option<String> = if let Some(ref lp) = last_pk {
-            sqlx::query_scalar(&select_last_next)
+        let (next_last, moved_rows): (Option<String>, i64) = if let Some(ref lp) = last_pk {
+            sqlx::query_as(&backfill_next)
                 .bind(lp)
                 .bind(chunk_size)
-                .fetch_optional(pool)
+                .fetch_one(&mut **conn)
                 .await?
         } else {
-            sqlx::query_scalar(&select_last_initial)
+            sqlx::query_as(&backfill_initial)
                 .bind(chunk_size)
-                .fetch_optional(pool)
+                .fetch_one(&mut **conn)
                 .await?
         };
 
-        let Some(next_last) = next_last else {
+        let Some(next_last) = next_last else { break };
+        if moved_rows <= 0 {
             break;
-        };
+        }
 
-        let batch_start = Instant::now();
-        let inserted = if let Some(ref lp) = last_pk {
-            sqlx::query(&insert_range)
-                .bind(lp)
-                .bind(&next_last)
-                .execute(pool)
-                .await?
-                .rows_affected()
-        } else {
-            sqlx::query(&insert_initial)
-                .bind(&next_last)
-                .execute(pool)
-                .await?
-                .rows_affected()
-        };
-        let batch_ms = batch_start.elapsed().as_millis() as u64;
-
-        total_rows = total_rows.saturating_add(inserted as u64);
+        total_rows = total_rows.saturating_add(moved_rows as u64);
         last_pk = Some(next_last);
-        let _ = batch_ms; // reserved for future backfill-specific tuning knobs
 
         if cfg.online_sleep_ms > 0 {
             tokio::time::sleep(Duration::from_millis(cfg.online_sleep_ms)).await;
@@ -491,7 +539,7 @@ async fn backfill(
 }
 
 async fn catch_up_best_effort(
-    pool: &PgPool,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     source: &str,
     shadow: &str,
     changelog: &str,
@@ -535,6 +583,7 @@ async fn catch_up_best_effort(
         .join(", ");
 
     // Range boundary selection from changelog (order by typed pk, return boundary as text).
+    // This keeps `DELETE FROM changelog` range-based (fast) and avoids heavy `RETURNING` work.
     let select_last_initial = format!(
         "SELECT pk::text FROM (SELECT pk FROM {changelog} ORDER BY pk LIMIT $1) s ORDER BY pk DESC LIMIT 1",
         changelog = changelog_q
@@ -553,12 +602,12 @@ async fn catch_up_best_effort(
             sqlx::query_scalar(&select_last_next)
                 .bind(lp)
                 .bind(chunk_size)
-                .fetch_optional(pool)
+                .fetch_optional(&mut **conn)
                 .await?
         } else {
             sqlx::query_scalar(&select_last_initial)
                 .bind(chunk_size)
-                .fetch_optional(pool)
+                .fetch_optional(&mut **conn)
                 .await?
         };
 
@@ -607,10 +656,13 @@ async fn catch_up_best_effort(
             sqlx::query(&upsert)
                 .bind(lp)
                 .bind(&next_last)
-                .execute(pool)
+                .execute(&mut **conn)
                 .await?;
         } else {
-            sqlx::query(&upsert).bind(&next_last).execute(pool).await?;
+            sqlx::query(&upsert)
+                .bind(&next_last)
+                .execute(&mut **conn)
+                .await?;
         }
 
         let delete_missing = if last_pk.is_some() {
@@ -645,12 +697,12 @@ async fn catch_up_best_effort(
             sqlx::query(&delete_missing)
                 .bind(lp)
                 .bind(&next_last)
-                .execute(pool)
+                .execute(&mut **conn)
                 .await?;
         } else {
             sqlx::query(&delete_missing)
                 .bind(&next_last)
-                .execute(pool)
+                .execute(&mut **conn)
                 .await?;
         }
 
@@ -672,13 +724,13 @@ async fn catch_up_best_effort(
             sqlx::query(&clear)
                 .bind(lp)
                 .bind(&next_last)
-                .execute(pool)
+                .execute(&mut **conn)
                 .await?
                 .rows_affected()
         } else {
             sqlx::query(&clear)
                 .bind(&next_last)
-                .execute(pool)
+                .execute(&mut **conn)
                 .await?
                 .rows_affected()
         };
@@ -883,8 +935,8 @@ async fn cutover(
     })
 }
 
-// NOTE: Prior versions used pk list batches (`ANY($1::uuid[])`). We now prefer range-based
-// batching for fewer round-trips and less allocation.
+// NOTE: Prior versions used pk list batches (`ANY($1::uuid[])`). We now use typed ordering with
+// keyset/range batching to avoid large allocations and keep Postgres plans index-friendly.
 
 fn cast_type_for_param(pk_sql_type: &str) -> Result<&'static str> {
     match pk_sql_type.to_uppercase().as_str() {
@@ -896,6 +948,194 @@ fn cast_type_for_param(pk_sql_type: &str) -> Result<&'static str> {
             "unsupported primary key type for online rewrite: {other}"
         ))),
     }
+}
+
+fn is_parallel_backfill_pk(pk_sql_type: &str) -> bool {
+    matches!(pk_sql_type.to_uppercase().as_str(), "BIGINT" | "INT8")
+}
+
+async fn parallel_backfill_bigint(
+    pool: &PgPool,
+    source: &str,
+    shadow: &str,
+    pk: &'static str,
+    pk_sql_type: &str,
+    col_exprs: &[(&'static str, String)],
+    cfg: &MigrationConfig,
+) -> Result<u64> {
+    let pk_q = quote_identifier(pk);
+    let pk_cast = cast_type_for_param(pk_sql_type)?;
+    if pk_cast != "bigint" {
+        return Err(Error::MigrationNeeded(
+            "parallel backfill is only supported for BIGINT primary keys".to_string(),
+        ));
+    }
+
+    let (min_pk, max_pk): (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+        "SELECT MIN({pk_q})::bigint, MAX({pk_q})::bigint FROM {src}",
+        pk_q = pk_q,
+        src = quote_identifier(source),
+    ))
+    .fetch_one(pool)
+    .await?;
+
+    let (Some(min_pk), Some(max_pk)) = (min_pk, max_pk) else {
+        return Ok(0);
+    };
+
+    let workers = cfg.parallel_backfill_workers.clamp(1, 64);
+    if workers <= 1 || min_pk >= max_pk {
+        // Fall back to sequential; parallelism doesn't help on tiny/empty ranges.
+        let mut conn = pool.acquire().await?;
+        let mut cfg2 = cfg.clone();
+        cfg2.parallel_backfill = false;
+        return backfill(pool, &mut conn, source, shadow, pk, pk_sql_type, col_exprs, &cfg2).await;
+    }
+
+    let span = (max_pk - min_pk).saturating_add(1);
+    let step = (span + workers as i64 - 1) / workers as i64; // ceil
+
+    let columns = col_exprs
+        .iter()
+        .map(|(c, _)| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let moved_select = col_exprs
+        .iter()
+        .map(|(c, expr)| {
+            let expr_sql = if expr == "NULL" {
+                "NULL".to_string()
+            } else if expr.starts_with('"') {
+                format!("src.{expr}")
+            } else {
+                expr.clone()
+            };
+            format!("{expr_sql} AS {}", quote_identifier(c))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let chunk_size = cfg.online_chunk_size.max(1);
+
+    let mut tasks = Vec::with_capacity(workers);
+    for i in 0..workers {
+        let lo = min_pk.saturating_add(step.saturating_mul(i as i64));
+        let mut hi = lo.saturating_add(step).saturating_sub(1);
+        if hi > max_pk {
+            hi = max_pk;
+        }
+        if lo > hi {
+            continue;
+        }
+
+        let source = source.to_string();
+        let shadow = shadow.to_string();
+        let pk_q = pk_q.clone();
+        let columns = columns.clone();
+        let moved_select = moved_select.clone();
+        let cfg = cfg.clone();
+        let pool = pool.clone();
+
+        tasks.push(tokio::spawn(async move {
+            let initial_sql = format!(
+                r#"
+                WITH moved AS MATERIALIZED (
+                  SELECT {moved_select}
+                  FROM {src} AS src
+                  WHERE src.{pk_q} >= ($1::bigint) AND src.{pk_q} <= ($2::bigint)
+                  ORDER BY src.{pk_q}
+                  LIMIT $3
+                ),
+                _ins AS (
+                  INSERT INTO {shadow} ({columns})
+                  SELECT {columns} FROM moved
+                  ON CONFLICT ({pk_q}) DO NOTHING
+                )
+                SELECT
+                  (SELECT {pk_q}::bigint FROM moved ORDER BY {pk_q} DESC LIMIT 1) AS last_pk,
+                  (SELECT COUNT(*)::bigint FROM moved) AS moved_rows
+                "#,
+                moved_select = moved_select,
+                src = quote_identifier(&source),
+                shadow = quote_identifier(&shadow),
+                columns = columns,
+                pk_q = pk_q,
+            );
+
+            let next_sql = format!(
+                r#"
+                WITH moved AS MATERIALIZED (
+                  SELECT {moved_select}
+                  FROM {src} AS src
+                  WHERE src.{pk_q} > ($1::bigint) AND src.{pk_q} <= ($2::bigint)
+                  ORDER BY src.{pk_q}
+                  LIMIT $3
+                ),
+                _ins AS (
+                  INSERT INTO {shadow} ({columns})
+                  SELECT {columns} FROM moved
+                  ON CONFLICT ({pk_q}) DO NOTHING
+                )
+                SELECT
+                  (SELECT {pk_q}::bigint FROM moved ORDER BY {pk_q} DESC LIMIT 1) AS last_pk,
+                  (SELECT COUNT(*)::bigint FROM moved) AS moved_rows
+                "#,
+                moved_select = moved_select,
+                src = quote_identifier(&source),
+                shadow = quote_identifier(&shadow),
+                columns = columns,
+                pk_q = pk_q,
+            );
+
+            let mut moved_total: u64 = 0;
+            let mut last: Option<i64> = None;
+
+            let res: Result<u64> = with_synchronous_commit(&pool, &cfg, |conn| async move {
+                loop {
+                    let (next_last, moved_rows): (Option<i64>, i64) = if let Some(lp) = last {
+                        sqlx::query_as(&next_sql)
+                            .bind(lp)
+                            .bind(hi)
+                            .bind(chunk_size)
+                            .fetch_one(&mut **conn)
+                            .await?
+                    } else {
+                        sqlx::query_as(&initial_sql)
+                            .bind(lo)
+                            .bind(hi)
+                            .bind(chunk_size)
+                            .fetch_one(&mut **conn)
+                            .await?
+                    };
+
+                    let Some(next_last) = next_last else { break };
+                    if moved_rows <= 0 {
+                        break;
+                    }
+                    moved_total = moved_total.saturating_add(moved_rows as u64);
+                    last = Some(next_last);
+
+                    if cfg.online_sleep_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(cfg.online_sleep_ms)).await;
+                    }
+                }
+                Ok(moved_total)
+            })
+            .await;
+
+            res
+        }));
+    }
+
+    let joined = try_join_all(tasks)
+        .await
+        .map_err(|e| Error::Other(format!("parallel backfill join error: {e}")))?;
+
+    joined.into_iter().try_fold(0u64, |acc, r| {
+        let v = r?;
+        Ok(acc.saturating_add(v))
+    })
 }
 
 fn on_conflict_clause(pk_q: &str, set_parts: &str) -> String {
