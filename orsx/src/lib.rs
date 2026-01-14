@@ -1,6 +1,8 @@
 pub mod error;
+pub mod config;
 
 pub use error::{Error, Result};
+pub use config::Config;
 
 pub use sqlx;
 
@@ -32,4 +34,3 @@ pub mod prelude {
     pub use crate::quote_identifier;
     pub use sqlx;
 }
-
