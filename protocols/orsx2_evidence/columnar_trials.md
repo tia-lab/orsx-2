@@ -123,3 +123,24 @@ Results (COPY time is just `next_batch_into`, row-wise is full per-cell `try_get
 
 Notes:
 - The perf test also computes identical columnar vs row-wise checksums (outside the COPY timing) to validate correctness at scale.
+
+### 2026-01-14 14:07:01Z — Fair baseline: row-wise builds the same columnar batch (release)
+
+Change:
+- Updated perf methodology: the row-wise path now builds a `ColumnarBatch` too (same schema, same NULLs), instead of only decoding into locals.
+
+Command:
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+
+Results (end-to-end retrieval + building the in-memory columnar batch):
+- 100k × 50 cols:
+  - COPY → `ColumnarBatch`: `289.166555ms`
+  - Row-wise → `ColumnarBatch`: `246.973727ms`
+- 100k × 500 cols:
+  - COPY → `ColumnarBatch`: `2.566705801s`
+  - Row-wise → `ColumnarBatch`: `2.780923222s`
+
+Notes:
+- Both paths compute matching checksums (id/f64/text/bytea) to validate correctness at scale.
+- Interpretation: for very wide tables, COPY BINARY starts to win when you actually need to materialize a columnar batch.

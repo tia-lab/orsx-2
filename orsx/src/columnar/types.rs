@@ -335,6 +335,105 @@ impl ColumnarBatch {
         Ok(())
     }
 
+    pub fn current_row_index(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn push_null(&mut self, col_idx: usize) -> Result<()> {
+        let row_idx = self.row_count;
+        if row_idx >= self.row_capacity {
+            return Err(Error::Other("columnar batch is full".to_string()));
+        }
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+
+        col.set_validity(row_idx, false)?;
+        match col {
+            ColumnData::Fixed { width, values, .. } => {
+                let start = values.len();
+                let new_len = start
+                    .checked_add(*width)
+                    .ok_or_else(|| Error::Other("fixed column size overflow".to_string()))?;
+                values.resize(new_len, 0);
+            }
+            ColumnData::Var { offsets, data, .. } => {
+                let len_u32: u32 = data
+                    .len()
+                    .try_into()
+                    .map_err(|_| Error::Other("var column too large".to_string()))?;
+                offsets.push(len_u32);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn push_fixed_bytes(&mut self, col_idx: usize, bytes: &[u8], encoding: FixedEncoding) -> Result<()> {
+        let row_idx = self.row_count;
+        if row_idx >= self.row_capacity {
+            return Err(Error::Other("columnar batch is full".to_string()));
+        }
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::Fixed {
+                width,
+                encoding: enc,
+                values,
+                ..
+            } => {
+                if bytes.len() != *width {
+                    return Err(Error::Other("fixed-width byte length mismatch".to_string()));
+                }
+                *enc = encoding;
+                values.extend_from_slice(bytes);
+            }
+            _ => return Err(Error::Other("expected fixed-width column".to_string())),
+        }
+        Ok(())
+    }
+
+    pub fn push_utf8(&mut self, col_idx: usize, s: &str) -> Result<()> {
+        self.push_var_bytes(col_idx, s.as_bytes())
+    }
+
+    pub fn push_var_bytes(&mut self, col_idx: usize, bytes: &[u8]) -> Result<()> {
+        let row_idx = self.row_count;
+        if row_idx >= self.row_capacity {
+            return Err(Error::Other("columnar batch is full".to_string()));
+        }
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::Var { data, offsets, .. } => {
+                data.extend_from_slice(bytes);
+                let len_u32: u32 = data
+                    .len()
+                    .try_into()
+                    .map_err(|_| Error::Other("var column too large".to_string()))?;
+                offsets.push(len_u32);
+            }
+            _ => return Err(Error::Other("expected varlen column".to_string())),
+        }
+        Ok(())
+    }
+
+    pub fn end_row(&mut self) -> Result<()> {
+        if self.row_count >= self.row_capacity {
+            return Err(Error::Other("columnar batch is full".to_string()));
+        }
+        self.finish_row()
+    }
+
     fn finish_row(&mut self) -> Result<()> {
         self.row_count = self
             .row_count
@@ -655,6 +754,9 @@ impl<'c> CopyBinaryBatchReader<'c> {
     }
 
     async fn read_slice(&mut self, n: usize) -> Result<&[u8]> {
+        if n == 0 {
+            return Ok(&[]);
+        }
         self.ensure_available(n).await?;
         let start = self.pos;
         let end = start
