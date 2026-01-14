@@ -1,0 +1,18 @@
+[package]
+name = "orsx"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "orsx2 rewrite in progress: Postgres migrations + compression over sqlx"
+
+[dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+orsx-macros = { path = "../orsx-macros" }
+
