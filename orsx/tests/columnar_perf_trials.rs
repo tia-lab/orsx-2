@@ -1,4 +1,6 @@
-use orsx::columnar::{ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader};
+use orsx::columnar::{
+    ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader, FixedEncoding,
+};
 use futures_util::TryStreamExt;
 use sqlx::{Connection, Executor};
 use sqlx::Row;
@@ -92,9 +94,82 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
     let dt_copy = t0.elapsed();
     assert_eq!(got_rows, rows);
 
-    // Prevent dead-code elimination in release perf runs.
+    // Columnar-side checksum/decoding to make the work comparable and prevent DCE.
     let mut checksum: u64 = 0;
-    if let Some(values) = batch.fixed_values_bytes(0) {
+    let mut col_sum_len = 0usize;
+    let mut col_sum_i64: i64 = 0;
+    let mut col_sum_f64_bits: u64 = 0;
+    let mut col_sum_bytes: u64 = 0;
+    {
+        // id
+        let validity = batch.column_validity_bytes(0).unwrap();
+        let values = batch.fixed_values_bytes(0).unwrap();
+        let enc = batch.fixed_encoding(0).unwrap();
+        for row in 0..rows {
+            if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
+                continue;
+            }
+            let start = row * 8;
+            let slice = &values[start..start + 8];
+            let v = match enc {
+                FixedEncoding::Le => i64::from_le_bytes(slice.try_into().unwrap()),
+                FixedEncoding::PgBe => i64::from_be_bytes(slice.try_into().unwrap()),
+            };
+            col_sum_i64 = col_sum_i64.wrapping_add(v);
+        }
+
+        // f64 columns (1..=fcols)
+        for col in 1..=fcols {
+            let validity = batch.column_validity_bytes(col).unwrap();
+            let values = batch.fixed_values_bytes(col).unwrap();
+            let enc = batch.fixed_encoding(col).unwrap();
+            for row in 0..rows {
+                if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
+                    continue;
+                }
+                let start = row * 8;
+                let slice = &values[start..start + 8];
+                let bits = match enc {
+                    FixedEncoding::Le => u64::from_le_bytes(slice.try_into().unwrap()),
+                    FixedEncoding::PgBe => u64::from_be_bytes(slice.try_into().unwrap()),
+                };
+                col_sum_f64_bits = col_sum_f64_bits.wrapping_add(bits);
+            }
+        }
+
+        // t
+        {
+            let col_idx = fcols + 1;
+            let validity = batch.column_validity_bytes(col_idx).unwrap();
+            let (offsets, _data) = batch.var_slices(col_idx).unwrap();
+            for row in 0..rows {
+                if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
+                    continue;
+                }
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                col_sum_len = col_sum_len.wrapping_add(end - start);
+            }
+        }
+
+        // by
+        {
+            let col_idx = fcols + 2;
+            let validity = batch.column_validity_bytes(col_idx).unwrap();
+            let (offsets, data) = batch.var_slices(col_idx).unwrap();
+            for row in 0..rows {
+                if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
+                    continue;
+                }
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                for &x in &data[start..end] {
+                    col_sum_bytes = col_sum_bytes.wrapping_add(x as u64);
+                }
+            }
+        }
+
+        // Cheap checksum (first 64 bytes of the id column buffer).
         for &b in values.iter().take(64) {
             checksum = checksum.wrapping_add(b as u64);
         }
@@ -138,8 +213,7 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
     assert_eq!(rows_seen, rows);
 
     eprintln!(
-        "orscol_perf: rows={rows} cols={cols} fcols={fcols} checksum={checksum} sum_len={sum_len} sum_i64={sum_i64} sum_f64_bits={sum_f64_bits} sum_bytes={sum_bytes} copy={:?} row_wise={:?}",
-        dt_copy,
-        dt_row
+        "orscol_perf: rows={rows} cols={cols} fcols={fcols} checksum={checksum} copy={:?} row_wise={:?} | col_sum_len={col_sum_len} col_sum_i64={col_sum_i64} col_sum_f64_bits={col_sum_f64_bits} col_sum_bytes={col_sum_bytes} | row_sum_len={sum_len} row_sum_i64={sum_i64} row_sum_f64_bits={sum_f64_bits} row_sum_bytes={sum_bytes}",
+        dt_copy, dt_row
     );
 }

@@ -18,6 +18,12 @@ pub enum ColumnarType {
     Bytes,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum FixedEncoding {
+    Le,
+    PgBe,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnarField {
     pub name: Option<String>,
@@ -116,6 +122,7 @@ impl ValidityBitmap {
 pub(crate) enum ColumnData {
     Fixed {
         ty: ColumnarType,
+        encoding: FixedEncoding,
         width: usize,
         validity: ValidityBitmap,
         values: Vec<u8>,
@@ -139,30 +146,35 @@ impl ColumnData {
             }),
             ColumnarType::Bool => Ok(ColumnData::Fixed {
                 ty,
+                encoding: FixedEncoding::Le,
                 width: 1,
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
             ColumnarType::I16 => Ok(ColumnData::Fixed {
                 ty,
+                encoding: FixedEncoding::Le,
                 width: 2,
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
             ColumnarType::I32 | ColumnarType::F32 => Ok(ColumnData::Fixed {
                 ty,
+                encoding: FixedEncoding::Le,
                 width: 4,
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
             ColumnarType::I64 | ColumnarType::F64 | ColumnarType::TimestampTzMicros => Ok(ColumnData::Fixed {
                 ty,
+                encoding: FixedEncoding::Le,
                 width: 8,
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
             ColumnarType::Uuid => Ok(ColumnData::Fixed {
                 ty,
+                encoding: FixedEncoding::Le,
                 width: 16,
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
@@ -174,6 +186,13 @@ impl ColumnData {
         match self {
             ColumnData::Fixed { ty, .. } => *ty,
             ColumnData::Var { ty, .. } => *ty,
+        }
+    }
+
+    fn fixed_encoding(&self) -> Option<FixedEncoding> {
+        match self {
+            ColumnData::Fixed { encoding, .. } => Some(*encoding),
+            ColumnData::Var { .. } => None,
         }
     }
 
@@ -294,6 +313,10 @@ impl ColumnarBatch {
         self.columns.get(idx).and_then(|c| c.fixed_values_bytes())
     }
 
+    pub fn fixed_encoding(&self, idx: usize) -> Option<FixedEncoding> {
+        self.columns.get(idx).and_then(|c| c.fixed_encoding())
+    }
+
     pub fn var_slices(&self, idx: usize) -> Option<(&[u32], &[u8])> {
         self.columns.get(idx).and_then(|c| c.var_slices())
     }
@@ -313,15 +336,6 @@ impl ColumnarBatch {
     }
 
     fn finish_row(&mut self) -> Result<()> {
-        for col in &mut self.columns {
-            if let ColumnData::Var { offsets, data, .. } = col {
-                let len_u32: u32 = data
-                    .len()
-                    .try_into()
-                    .map_err(|_| Error::Other("var column too large".to_string()))?;
-                offsets.push(len_u32);
-            }
-        }
         self.row_count = self
             .row_count
             .checked_add(1)
@@ -398,6 +412,22 @@ impl<'c> CopyBinaryBatchReader<'c> {
         }
 
         out.prepare(out.row_capacity())?;
+        // Set fixed-width encoding once per column to avoid per-cell overhead.
+        for (i, col) in out.columns.iter_mut().enumerate() {
+            let Some(field) = out.schema.fields().get(i) else {
+                return Err(Error::Other("schema/column mismatch".to_string()));
+            };
+            if let ColumnData::Fixed { encoding, .. } = col {
+                *encoding = match field.ty {
+                    ColumnarType::I16
+                    | ColumnarType::I32
+                    | ColumnarType::I64
+                    | ColumnarType::F32
+                    | ColumnarType::F64 => FixedEncoding::PgBe,
+                    _ => FixedEncoding::Le,
+                };
+            }
+        }
 
         if !self.header_parsed {
             self.parse_header().await?;
@@ -487,7 +517,13 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         .ok_or_else(|| Error::Other("fixed column size overflow".to_string()))?;
                     values.resize(new_len, 0);
                 }
-                ColumnData::Var { .. } => {}
+                ColumnData::Var { offsets, data, .. } => {
+                    let len_u32: u32 = data
+                        .len()
+                        .try_into()
+                        .map_err(|_| Error::Other("var column too large".to_string()))?;
+                    offsets.push(len_u32);
+                }
             }
             return Ok(());
         }
@@ -513,44 +549,27 @@ impl<'c> CopyBinaryBatchReader<'c> {
                     )));
                 }
                 let bytes = self.read_slice(len_usize).await?;
-                let start = values.len();
-                let new_len = start
-                    .checked_add(*width)
-                    .ok_or_else(|| Error::Other("fixed column size overflow".to_string()))?;
-                values.resize(new_len, 0);
-                let dst = &mut values[start..new_len];
                 match ty {
                     ColumnarType::Bool => {
-                        dst[0] = bytes[0];
+                        values.push(bytes[0]);
                     }
                     ColumnarType::I16 => {
-                        let v = i16::from_be_bytes([bytes[0], bytes[1]]);
-                        dst.copy_from_slice(&v.to_le_bytes());
+                        values.extend_from_slice(bytes);
                     }
                     ColumnarType::I32 => {
-                        let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        dst.copy_from_slice(&v.to_le_bytes());
+                        values.extend_from_slice(bytes);
                     }
                     ColumnarType::I64 => {
-                        let v = i64::from_be_bytes([
-                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                            bytes[7],
-                        ]);
-                        dst.copy_from_slice(&v.to_le_bytes());
+                        values.extend_from_slice(bytes);
                     }
                     ColumnarType::F32 => {
-                        let u = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        dst.copy_from_slice(&u.to_le_bytes());
+                        values.extend_from_slice(bytes);
                     }
                     ColumnarType::F64 => {
-                        let u = u64::from_be_bytes([
-                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                            bytes[7],
-                        ]);
-                        dst.copy_from_slice(&u.to_le_bytes());
+                        values.extend_from_slice(bytes);
                     }
                     ColumnarType::Uuid => {
-                        dst.copy_from_slice(bytes);
+                        values.extend_from_slice(bytes);
                     }
                     ColumnarType::TimestampTzMicros => {
                         let pg_micros = i64::from_be_bytes([
@@ -566,7 +585,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         let unix_micros = pg_micros
                             .checked_add(UNIX_TO_PG_EPOCH_MICROS)
                             .ok_or_else(|| Error::Other("timestamp overflow".to_string()))?;
-                        dst.copy_from_slice(&unix_micros.to_le_bytes());
+                        values.extend_from_slice(&unix_micros.to_le_bytes());
                     }
                     ColumnarType::Utf8 | ColumnarType::Bytes => {
                         return Err(Error::Other("internal type mismatch".to_string()));
@@ -588,6 +607,13 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         data.extend_from_slice(bytes);
                     }
                     _ => return Err(Error::Other("internal type mismatch".to_string())),
+                }
+                let len_u32: u32 = data
+                    .len()
+                    .try_into()
+                    .map_err(|_| Error::Other("var column too large".to_string()))?;
+                if let ColumnData::Var { offsets, .. } = col {
+                    offsets.push(len_u32);
                 }
                 self.maybe_compact();
             }
@@ -620,9 +646,12 @@ impl<'c> CopyBinaryBatchReader<'c> {
             self.pos = 0;
             return;
         }
-        self.buf.copy_within(self.pos.., 0);
-        self.buf.truncate(remaining);
-        self.pos = 0;
+        // Avoid repeatedly moving large tails; compact only when the remaining tail is small.
+        if remaining <= self.cfg.compact_after_bytes {
+            self.buf.copy_within(self.pos.., 0);
+            self.buf.truncate(remaining);
+            self.pos = 0;
+        }
     }
 
     async fn read_slice(&mut self, n: usize) -> Result<&[u8]> {

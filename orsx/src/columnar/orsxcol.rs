@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 
-use super::types::{ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, ColumnData};
+use super::types::{ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, ColumnData, FixedEncoding};
 
 const MAGIC: &[u8; 8] = b"ORSXCOL1";
 const VERSION: u16 = 1;
@@ -84,7 +84,25 @@ pub fn encode_orsxcol_v1_into(batch: &ColumnarBatch, out: &mut Vec<u8>) -> Resul
     for (field, col) in batch.schema.fields().iter().zip(batch.columns.iter()) {
         let tid = type_id(field.ty);
         write_u16_le(out, tid);
-        write_u16_le(out, 0); // encoding_id = plain
+        let encoding_id: u16 = match col {
+            ColumnData::Fixed { encoding, ty, .. } => match encoding {
+                FixedEncoding::Le => 0,
+                FixedEncoding::PgBe => match ty {
+                    ColumnarType::I16
+                    | ColumnarType::I32
+                    | ColumnarType::I64
+                    | ColumnarType::F32
+                    | ColumnarType::F64 => 1,
+                    _ => {
+                        return Err(Error::Other(
+                            "PgBe encoding only supported for numeric fixed-width columns".to_string(),
+                        ))
+                    }
+                },
+            },
+            ColumnData::Var { .. } => 0,
+        };
+        write_u16_le(out, encoding_id);
 
         let name_bytes = field.name.as_deref().unwrap_or("").as_bytes();
         let name_len: u16 = name_bytes
@@ -176,7 +194,7 @@ pub fn decode_orsxcol_v1(bytes: &[u8]) -> Result<ColumnarBatch> {
     for _ in 0..col_count {
         let tid = read_u16_le(bytes, &mut pos)?;
         let ty = type_from_id(tid)?;
-        let _encoding_id = read_u16_le(bytes, &mut pos)?;
+        let encoding_id = read_u16_le(bytes, &mut pos)?;
 
         let name_len = read_u16_le(bytes, &mut pos)? as usize;
         let name_bytes = take(bytes, &mut pos, name_len)?;
@@ -205,6 +223,9 @@ pub fn decode_orsxcol_v1(bytes: &[u8]) -> Result<ColumnarBatch> {
 
         match ty {
             ColumnarType::Utf8 | ColumnarType::Bytes => {
+                if encoding_id != 0 {
+                    return Err(Error::Other("invalid encoding for varlen column".to_string()));
+                }
                 let expected_offsets_len = (row_count + 1)
                     .checked_mul(4)
                     .ok_or_else(|| Error::Other("offsets overflow".to_string()))?;
@@ -260,12 +281,30 @@ pub fn decode_orsxcol_v1(bytes: &[u8]) -> Result<ColumnarBatch> {
                 let mut col = ColumnData::new(ty)?;
                 if let ColumnData::Fixed {
                     width,
+                    encoding,
                     validity: v,
                     values,
                     ..
                 } = &mut col
                 {
                     v.bytes = validity;
+                    *encoding = match encoding_id {
+                        0 => FixedEncoding::Le,
+                        1 => match ty {
+                            ColumnarType::I16
+                            | ColumnarType::I32
+                            | ColumnarType::I64
+                            | ColumnarType::F32
+                            | ColumnarType::F64 => FixedEncoding::PgBe,
+                            _ => {
+                                return Err(Error::Other(
+                                    "PgBe encoding only supported for numeric fixed-width columns"
+                                        .to_string(),
+                                ))
+                            }
+                        },
+                        _ => return Err(Error::Other("unknown fixed encoding id".to_string())),
+                    };
                     let expected_values_len = row_count
                         .checked_mul(*width)
                         .ok_or_else(|| Error::Other("values overflow".to_string()))?;
@@ -334,7 +373,14 @@ mod tests {
         let mut c1 = ColumnData::new(ColumnarType::Utf8).unwrap();
         let mut c2 = ColumnData::new(ColumnarType::Bytes).unwrap();
 
-        if let ColumnData::Fixed { validity, values, .. } = &mut c0 {
+        if let ColumnData::Fixed {
+            encoding,
+            validity,
+            values,
+            ..
+        } = &mut c0
+        {
+            *encoding = FixedEncoding::Le;
             validity.bytes = vec![0b0000_0101]; // rows 0 and 2 valid
             values.extend_from_slice(&le_i64(10));
             values.extend_from_slice(&le_i64(0)); // null placeholder
@@ -393,18 +439,21 @@ mod tests {
                 (
                     ColumnData::Fixed {
                         ty: ty_a,
+                        encoding: e_a,
                         width: w_a,
                         validity: v_a,
                         values: vals_a,
                     },
                     ColumnData::Fixed {
                         ty: ty_b,
+                        encoding: e_b,
                         width: w_b,
                         validity: v_b,
                         values: vals_b,
                     },
                 ) => {
                     assert_eq!(ty_a, ty_b);
+                    assert_eq!(e_a, e_b);
                     assert_eq!(w_a, w_b);
                     assert_eq!(v_a.bytes, v_b.bytes);
                     assert_eq!(vals_a, vals_b);
