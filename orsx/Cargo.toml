@@ -20,6 +20,7 @@ orsx-macros = { path = "../orsx-macros" }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 criterion = { workspace = true }
 
 [[bench]]

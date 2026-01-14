@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FieldType {
     Text,
+    Uuid,
     Integer,
     BigInt,
     Real,
@@ -22,6 +23,7 @@ impl FieldType {
     pub fn to_sql(&self) -> String {
         match self {
             FieldType::Text => "TEXT".to_string(),
+            FieldType::Uuid => "UUID".to_string(),
             FieldType::Integer => "INTEGER".to_string(),
             FieldType::BigInt => "BIGINT".to_string(),
             FieldType::Real => "REAL".to_string(),
@@ -38,4 +40,3 @@ impl FieldType {
         }
     }
 }
-

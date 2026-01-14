@@ -102,6 +102,7 @@ fn unwrap_option(ty: &Type) -> (bool, Type) {
 fn rust_type_to_field_type(ty: &Type) -> proc_macro2::TokenStream {
     match type_name(ty).as_deref() {
         Some("String") | Some("str") => quote! { orsx::FieldType::Text },
+        Some("Uuid") => quote! { orsx::FieldType::Uuid },
         Some("i32") => quote! { orsx::FieldType::Integer },
         Some("i64") => quote! { orsx::FieldType::BigInt },
         Some("f32") => quote! { orsx::FieldType::Real },

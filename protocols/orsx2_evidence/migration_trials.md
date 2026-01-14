@@ -64,3 +64,65 @@ Outcome:
 - Cutover lock duration: enforced in code (budget: 5000ms); value not printed in this trial
 - Backfill duration: bounded by small test scale (sub-second end-to-end test runtime)
 - Verification method and result: post-migration `SELECT COUNT(*)` + `age IS NOT NULL` assertions; OK
+
+---
+
+## Online rewrite: big table UUID PK (200k rows fast-pass, release)
+
+Date (UTC): 2026-01-14T10:34:00Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 200,000 seeded + 20,000 concurrent inserts (writer)
+- Row width estimate: ~50 columns (`id UUID` PK + 49 `INTEGER NOT NULL` + new `INTEGER NOT NULL DEFAULT 0`)
+- Indexes: primary key
+- Write load during test: concurrent inserts during migration (batch inserts via `uuid_generate_v1mc()` + `generate_series`)
+
+Migration case:
+- Change type: add `new_col INTEGER NOT NULL DEFAULT 0` (rewrite-class change)
+- Strategy (offline/online): online shadow-table rewrite with trigger mirroring + changelog drain, 5s cutover budget
+
+Command(s):
+- `ORSX_BIG_ROWS=200000 ORSX_BIG_WRITER_ROWS=20000 cargo test -p orsx --release --test migrations_online_big_uuid -- --ignored --nocapture`
+
+Outcome:
+- Success/failure: success
+- Cutover lock duration: enforced in code (budget: 5000ms); value not printed in this trial
+- Backfill duration: seed ~2.84s; migration total ~3.46s (release build; includes backfill + catchup + cutover)
+- Verification method and result: `COUNT(*)` >= seeded and `new_col IS NULL = 0`; OK
+
+---
+
+## Online rewrite: big table UUID PK (1M rows, release)
+
+Date (UTC): 2026-01-14T10:48:43Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 1,000,000 seeded + 100,000 concurrent inserts (writer) → final 1,100,000
+- Row width estimate: ~51 columns (`id UUID` PK + 49 `INTEGER NOT NULL` + new `INTEGER NOT NULL DEFAULT 0`)
+- Indexes: primary key
+- Write load during test: concurrent inserts during migration (batch inserts via `uuid_generate_v1mc()` + `generate_series`)
+
+Migration case:
+- Change type: add `new_col INTEGER NOT NULL DEFAULT 0` (rewrite-class change)
+- Strategy (offline/online): online shadow-table rewrite with trigger mirroring + changelog drain, 5s cutover budget
+
+Command(s):
+- `ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 cargo test -p orsx --release --test migrations_online_big_uuid -- --ignored --nocapture`
+
+Outcome:
+- Success/failure: success
+- Cutover lock duration: ~1012ms (budget 5000ms)
+- Backfill duration: ~21.324s (backfill_rows reported: 1,100,000)
+- Catchup (pre-lock) duration: ~3.559s (drained_pk reported: 90,000)
+- Total online rewrite duration (inside `online_rewrite_table`): ~26.014s (migrations wrapper logged ~26.086s)
+- Verification method and result: `new_col IS NULL = 0` and final rowcount; OK
