@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 
-use super::types::{ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, ColumnData, FixedEncoding};
+use super::types::{ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, ColumnData};
 
 const MAGIC: &[u8; 8] = b"ORSXCOL1";
 const VERSION: u16 = 1;
@@ -84,25 +84,7 @@ pub fn encode_orsxcol_v1_into(batch: &ColumnarBatch, out: &mut Vec<u8>) -> Resul
     for (field, col) in batch.schema.fields().iter().zip(batch.columns.iter()) {
         let tid = type_id(field.ty);
         write_u16_le(out, tid);
-        let encoding_id: u16 = match col {
-            ColumnData::Fixed { encoding, ty, .. } => match encoding {
-                FixedEncoding::Le => 0,
-                FixedEncoding::PgBe => match ty {
-                    ColumnarType::I16
-                    | ColumnarType::I32
-                    | ColumnarType::I64
-                    | ColumnarType::F32
-                    | ColumnarType::F64 => 1,
-                    _ => {
-                        return Err(Error::Other(
-                            "PgBe encoding only supported for numeric fixed-width columns".to_string(),
-                        ))
-                    }
-                },
-            },
-            ColumnData::Var { .. } => 0,
-        };
-        write_u16_le(out, encoding_id);
+        write_u16_le(out, 0); // encoding_id = plain (v1: fixed values are little-endian)
 
         let name_bytes = field.name.as_deref().unwrap_or("").as_bytes();
         let name_len: u16 = name_bytes
@@ -113,8 +95,15 @@ pub fn encode_orsxcol_v1_into(batch: &ColumnarBatch, out: &mut Vec<u8>) -> Resul
         out.extend_from_slice(name_bytes);
 
         let validity: &[u8] = match col {
-            ColumnData::Fixed { validity, .. } => validity.bytes.as_slice(),
             ColumnData::Var { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedBool { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedI16 { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedI32 { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedI64 { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedF32Bits { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedF64Bits { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedUuid { validity, .. } => validity.bytes.as_slice(),
+            ColumnData::FixedTimestampMicros { validity, .. } => validity.bytes.as_slice(),
         };
         if validity.len() != expected_validity {
             return Err(Error::Other("validity length mismatch".to_string()));
@@ -122,8 +111,151 @@ pub fn encode_orsxcol_v1_into(batch: &ColumnarBatch, out: &mut Vec<u8>) -> Resul
         write_bytes_len_u32(out, validity)?;
 
         match col {
-            ColumnData::Fixed { values, .. } => {
-                write_bytes_len_u32(out, values)?;
+            ColumnData::FixedBool { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed bool length mismatch".to_string()));
+                }
+                write_bytes_len_u32(out, values.as_slice())?;
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedI16 { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed i16 length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(2)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for &v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedI32 { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed i32 length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for &v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedI64 { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed i64 length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for &v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedF32Bits { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed f32 length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for &v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedF64Bits { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed f64 length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for &v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedUuid { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed uuid length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(16)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for v in values {
+                    out.extend_from_slice(v);
+                }
+                write_u32_le(out, 0);
+            }
+            ColumnData::FixedTimestampMicros { values, .. } => {
+                if values.len() != batch.row_count {
+                    return Err(Error::Other("fixed timestamp length mismatch".to_string()));
+                }
+                let byte_len = batch
+                    .row_count
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::Other("values overflow".to_string()))?;
+                write_u32_le(
+                    out,
+                    byte_len
+                        .try_into()
+                        .map_err(|_| Error::Other("payload too large".to_string()))?,
+                );
+                out.reserve(byte_len);
+                for &v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
                 write_u32_le(out, 0);
             }
             ColumnData::Var { offsets, data, .. } => {
@@ -275,43 +407,147 @@ pub fn decode_orsxcol_v1(bytes: &[u8]) -> Result<ColumnarBatch> {
                 columns.push(col);
             }
             _ => {
+                if encoding_id != 0 {
+                    return Err(Error::Other("invalid encoding for fixed column".to_string()));
+                }
                 if payload2_len != 0 {
                     return Err(Error::Other("fixed-width payload_2 must be empty".to_string()));
                 }
                 let mut col = ColumnData::new(ty)?;
-                if let ColumnData::Fixed {
-                    width,
-                    encoding,
-                    validity: v,
-                    values,
-                    ..
-                } = &mut col
-                {
-                    v.bytes = validity;
-                    *encoding = match encoding_id {
-                        0 => FixedEncoding::Le,
-                        1 => match ty {
-                            ColumnarType::I16
-                            | ColumnarType::I32
-                            | ColumnarType::I64
-                            | ColumnarType::F32
-                            | ColumnarType::F64 => FixedEncoding::PgBe,
-                            _ => {
-                                return Err(Error::Other(
-                                    "PgBe encoding only supported for numeric fixed-width columns"
-                                        .to_string(),
-                                ))
-                            }
-                        },
-                        _ => return Err(Error::Other("unknown fixed encoding id".to_string())),
-                    };
-                    let expected_values_len = row_count
-                        .checked_mul(*width)
-                        .ok_or_else(|| Error::Other("values overflow".to_string()))?;
-                    if payload1.len() != expected_values_len {
-                        return Err(Error::Other("values length mismatch".to_string()));
+                // fill validity
+                match &mut col {
+                    ColumnData::FixedBool { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.extend_from_slice(&payload1);
                     }
-                    *values = payload1;
+                    ColumnData::FixedI16 { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 2 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 2;
+                            values.push(i16::from_le_bytes([payload1[j], payload1[j + 1]]));
+                        }
+                    }
+                    ColumnData::FixedI32 { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 4 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 4;
+                            values.push(i32::from_le_bytes([
+                                payload1[j],
+                                payload1[j + 1],
+                                payload1[j + 2],
+                                payload1[j + 3],
+                            ]));
+                        }
+                    }
+                    ColumnData::FixedI64 { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 8 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 8;
+                            values.push(i64::from_le_bytes([
+                                payload1[j],
+                                payload1[j + 1],
+                                payload1[j + 2],
+                                payload1[j + 3],
+                                payload1[j + 4],
+                                payload1[j + 5],
+                                payload1[j + 6],
+                                payload1[j + 7],
+                            ]));
+                        }
+                    }
+                    ColumnData::FixedF32Bits { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 4 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 4;
+                            values.push(u32::from_le_bytes([
+                                payload1[j],
+                                payload1[j + 1],
+                                payload1[j + 2],
+                                payload1[j + 3],
+                            ]));
+                        }
+                    }
+                    ColumnData::FixedF64Bits { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 8 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 8;
+                            values.push(u64::from_le_bytes([
+                                payload1[j],
+                                payload1[j + 1],
+                                payload1[j + 2],
+                                payload1[j + 3],
+                                payload1[j + 4],
+                                payload1[j + 5],
+                                payload1[j + 6],
+                                payload1[j + 7],
+                            ]));
+                        }
+                    }
+                    ColumnData::FixedUuid { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 16 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 16;
+                            let mut a = [0u8; 16];
+                            a.copy_from_slice(&payload1[j..j + 16]);
+                            values.push(a);
+                        }
+                    }
+                    ColumnData::FixedTimestampMicros { validity: v, values } => {
+                        v.bytes = validity;
+                        if payload1.len() != row_count * 8 {
+                            return Err(Error::Other("values length mismatch".to_string()));
+                        }
+                        values.clear();
+                        values.reserve(row_count);
+                        for i in 0..row_count {
+                            let j = i * 8;
+                            values.push(i64::from_le_bytes([
+                                payload1[j],
+                                payload1[j + 1],
+                                payload1[j + 2],
+                                payload1[j + 3],
+                                payload1[j + 4],
+                                payload1[j + 5],
+                                payload1[j + 6],
+                                payload1[j + 7],
+                            ]));
+                        }
+                    }
+                    ColumnData::Var { .. } => return Err(Error::Other("internal type mismatch".to_string())),
                 }
                 columns.push(col);
             }
@@ -373,18 +609,11 @@ mod tests {
         let mut c1 = ColumnData::new(ColumnarType::Utf8).unwrap();
         let mut c2 = ColumnData::new(ColumnarType::Bytes).unwrap();
 
-        if let ColumnData::Fixed {
-            encoding,
-            validity,
-            values,
-            ..
-        } = &mut c0
-        {
-            *encoding = FixedEncoding::Le;
+        if let ColumnData::FixedI64 { validity, values } = &mut c0 {
             validity.bytes = vec![0b0000_0101]; // rows 0 and 2 valid
-            values.extend_from_slice(&le_i64(10));
-            values.extend_from_slice(&le_i64(0)); // null placeholder
-            values.extend_from_slice(&le_i64(30));
+            values.push(10);
+            values.push(0); // null placeholder
+            values.push(30);
         } else {
             panic!("expected fixed");
         }
@@ -437,24 +666,15 @@ mod tests {
         for (a, b) in batch.columns.iter().zip(decoded.columns.iter()) {
             match (a, b) {
                 (
-                    ColumnData::Fixed {
-                        ty: ty_a,
-                        encoding: e_a,
-                        width: w_a,
+                    ColumnData::FixedI64 {
                         validity: v_a,
                         values: vals_a,
                     },
-                    ColumnData::Fixed {
-                        ty: ty_b,
-                        encoding: e_b,
-                        width: w_b,
+                    ColumnData::FixedI64 {
                         validity: v_b,
                         values: vals_b,
                     },
                 ) => {
-                    assert_eq!(ty_a, ty_b);
-                    assert_eq!(e_a, e_b);
-                    assert_eq!(w_a, w_b);
                     assert_eq!(v_a.bytes, v_b.bytes);
                     assert_eq!(vals_a, vals_b);
                 }

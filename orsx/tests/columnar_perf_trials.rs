@@ -1,5 +1,5 @@
 use orsx::columnar::{
-    ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader, FixedEncoding,
+    ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader,
 };
 use futures_util::TryStreamExt;
 use sqlx::{Connection, Executor};
@@ -103,37 +103,23 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
     {
         // id
         let validity = batch.column_validity_bytes(0).unwrap();
-        let values = batch.fixed_values_bytes(0).unwrap();
-        let enc = batch.fixed_encoding(0).unwrap();
+        let values = batch.fixed_i64(0).unwrap();
         for row in 0..rows {
             if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
                 continue;
             }
-            let start = row * 8;
-            let slice = &values[start..start + 8];
-            let v = match enc {
-                FixedEncoding::Le => i64::from_le_bytes(slice.try_into().unwrap()),
-                FixedEncoding::PgBe => i64::from_be_bytes(slice.try_into().unwrap()),
-            };
-            col_sum_i64 = col_sum_i64.wrapping_add(v);
+            col_sum_i64 = col_sum_i64.wrapping_add(values[row]);
         }
 
         // f64 columns (1..=fcols)
         for col in 1..=fcols {
             let validity = batch.column_validity_bytes(col).unwrap();
-            let values = batch.fixed_values_bytes(col).unwrap();
-            let enc = batch.fixed_encoding(col).unwrap();
+            let values = batch.fixed_f64_bits(col).unwrap();
             for row in 0..rows {
                 if (validity[row / 8] & (1u8 << (row % 8))) == 0 {
                     continue;
                 }
-                let start = row * 8;
-                let slice = &values[start..start + 8];
-                let bits = match enc {
-                    FixedEncoding::Le => u64::from_le_bytes(slice.try_into().unwrap()),
-                    FixedEncoding::PgBe => u64::from_be_bytes(slice.try_into().unwrap()),
-                };
-                col_sum_f64_bits = col_sum_f64_bits.wrapping_add(bits);
+                col_sum_f64_bits = col_sum_f64_bits.wrapping_add(values[row]);
             }
         }
 
@@ -170,8 +156,8 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
         }
 
         // Cheap checksum (first 64 bytes of the id column buffer).
-        for &b in values.iter().take(64) {
-            checksum = checksum.wrapping_add(b as u64);
+        for &v in values.iter().take(64) {
+            checksum = checksum.wrapping_add(v as u64);
         }
     }
 
@@ -188,21 +174,13 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
     while let Some(row) = stream.try_next().await.unwrap() {
         let id: i64 = row.try_get(0).unwrap();
         sum_i64 = sum_i64.wrapping_add(id);
-        batch_row
-            .push_fixed_bytes(0, &id.to_be_bytes(), FixedEncoding::PgBe)
-            .unwrap();
+        batch_row.push_i64(0, id).unwrap();
 
         for col_idx in 1..=fcols {
             let v: Option<f64> = row.try_get(col_idx).unwrap();
             if let Some(x) = v {
                 sum_f64_bits = sum_f64_bits.wrapping_add(x.to_bits());
-                batch_row
-                    .push_fixed_bytes(
-                        col_idx,
-                        &x.to_bits().to_be_bytes(),
-                        FixedEncoding::PgBe,
-                    )
-                    .unwrap();
+                batch_row.push_f64_bits(col_idx, x.to_bits()).unwrap();
             } else {
                 batch_row.push_null(col_idx).unwrap();
             }

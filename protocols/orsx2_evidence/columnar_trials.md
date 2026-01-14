@@ -144,3 +144,26 @@ Results (end-to-end retrieval + building the in-memory columnar batch):
 Notes:
 - Both paths compute matching checksums (id/f64/text/bytea) to validate correctness at scale.
 - Interpretation: for very wide tables, COPY BINARY starts to win when you actually need to materialize a columnar batch.
+
+### 2026-01-14 14:17:08Z — Typed fixed-width buffers (release)
+
+Change:
+- Fixed-width columns now store typed buffers instead of raw byte buffers:
+  - `BIGINT -> Vec<i64>`, `INTEGER -> Vec<i32>`, `DOUBLE PRECISION -> Vec<u64>` (bits), `UUID -> Vec<[u8;16]>`, `TIMESTAMPTZ -> Vec<i64>` (unix micros).
+- COPY BINARY path decodes fixed-width values into the typed buffers.
+
+Command:
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+
+Results:
+- 100k × 50 cols:
+  - COPY → `ColumnarBatch`: `297.726311ms`
+  - Row-wise → `ColumnarBatch`: `289.757402ms`
+- 100k × 500 cols:
+  - COPY → `ColumnarBatch`: `2.613487862s`
+  - Row-wise → `ColumnarBatch`: `2.790430798s`
+
+Notes:
+- Checksums match between both paths (correctness).
+- Wide-table COPY advantage persists; narrow-table remains close.

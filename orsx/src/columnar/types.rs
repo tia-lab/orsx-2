@@ -18,12 +18,6 @@ pub enum ColumnarType {
     Bytes,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum FixedEncoding {
-    Le,
-    PgBe,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnarField {
     pub name: Option<String>,
@@ -120,12 +114,37 @@ impl ValidityBitmap {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ColumnData {
-    Fixed {
-        ty: ColumnarType,
-        encoding: FixedEncoding,
-        width: usize,
+    FixedBool {
         validity: ValidityBitmap,
         values: Vec<u8>,
+    },
+    FixedI16 {
+        validity: ValidityBitmap,
+        values: Vec<i16>,
+    },
+    FixedI32 {
+        validity: ValidityBitmap,
+        values: Vec<i32>,
+    },
+    FixedI64 {
+        validity: ValidityBitmap,
+        values: Vec<i64>,
+    },
+    FixedF32Bits {
+        validity: ValidityBitmap,
+        values: Vec<u32>,
+    },
+    FixedF64Bits {
+        validity: ValidityBitmap,
+        values: Vec<u64>,
+    },
+    FixedUuid {
+        validity: ValidityBitmap,
+        values: Vec<[u8; 16]>,
+    },
+    FixedTimestampMicros {
+        validity: ValidityBitmap,
+        values: Vec<i64>,
     },
     Var {
         ty: ColumnarType,
@@ -144,38 +163,35 @@ impl ColumnData {
                 offsets: vec![0],
                 data: Vec::new(),
             }),
-            ColumnarType::Bool => Ok(ColumnData::Fixed {
-                ty,
-                encoding: FixedEncoding::Le,
-                width: 1,
+            ColumnarType::Bool => Ok(ColumnData::FixedBool {
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
-            ColumnarType::I16 => Ok(ColumnData::Fixed {
-                ty,
-                encoding: FixedEncoding::Le,
-                width: 2,
+            ColumnarType::I16 => Ok(ColumnData::FixedI16 {
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
-            ColumnarType::I32 | ColumnarType::F32 => Ok(ColumnData::Fixed {
-                ty,
-                encoding: FixedEncoding::Le,
-                width: 4,
+            ColumnarType::I32 => Ok(ColumnData::FixedI32 {
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
-            ColumnarType::I64 | ColumnarType::F64 | ColumnarType::TimestampTzMicros => Ok(ColumnData::Fixed {
-                ty,
-                encoding: FixedEncoding::Le,
-                width: 8,
+            ColumnarType::I64 => Ok(ColumnData::FixedI64 {
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
-            ColumnarType::Uuid => Ok(ColumnData::Fixed {
-                ty,
-                encoding: FixedEncoding::Le,
-                width: 16,
+            ColumnarType::F32 => Ok(ColumnData::FixedF32Bits {
+                validity: ValidityBitmap::new(),
+                values: Vec::new(),
+            }),
+            ColumnarType::F64 => Ok(ColumnData::FixedF64Bits {
+                validity: ValidityBitmap::new(),
+                values: Vec::new(),
+            }),
+            ColumnarType::Uuid => Ok(ColumnData::FixedUuid {
+                validity: ValidityBitmap::new(),
+                values: Vec::new(),
+            }),
+            ColumnarType::TimestampTzMicros => Ok(ColumnData::FixedTimestampMicros {
                 validity: ValidityBitmap::new(),
                 values: Vec::new(),
             }),
@@ -184,32 +200,59 @@ impl ColumnData {
 
     fn ty(&self) -> ColumnarType {
         match self {
-            ColumnData::Fixed { ty, .. } => *ty,
+            ColumnData::FixedBool { .. } => ColumnarType::Bool,
+            ColumnData::FixedI16 { .. } => ColumnarType::I16,
+            ColumnData::FixedI32 { .. } => ColumnarType::I32,
+            ColumnData::FixedI64 { .. } => ColumnarType::I64,
+            ColumnData::FixedF32Bits { .. } => ColumnarType::F32,
+            ColumnData::FixedF64Bits { .. } => ColumnarType::F64,
+            ColumnData::FixedUuid { .. } => ColumnarType::Uuid,
+            ColumnData::FixedTimestampMicros { .. } => ColumnarType::TimestampTzMicros,
             ColumnData::Var { ty, .. } => *ty,
-        }
-    }
-
-    fn fixed_encoding(&self) -> Option<FixedEncoding> {
-        match self {
-            ColumnData::Fixed { encoding, .. } => Some(*encoding),
-            ColumnData::Var { .. } => None,
         }
     }
 
     fn prepare(&mut self, row_capacity: usize) -> Result<()> {
         match self {
-            ColumnData::Fixed {
-                width,
-                validity,
-                values,
-                ..
-            } => {
+            ColumnData::FixedBool { validity, values } => {
                 validity.prepare(row_capacity)?;
                 values.clear();
-                let cap = row_capacity
-                    .checked_mul(*width)
-                    .ok_or_else(|| Error::Other("fixed column capacity overflow".to_string()))?;
-                values.reserve(cap);
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedI16 { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedI32 { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedI64 { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedF32Bits { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedF64Bits { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedUuid { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
+            }
+            ColumnData::FixedTimestampMicros { validity, values } => {
+                validity.prepare(row_capacity)?;
+                values.clear();
+                values.reserve(row_capacity);
             }
             ColumnData::Var {
                 validity,
@@ -233,21 +276,42 @@ impl ColumnData {
 
     fn set_validity(&mut self, row_idx: usize, is_valid: bool) -> Result<()> {
         match self {
-            ColumnData::Fixed { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedBool { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedI16 { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedI32 { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedI64 { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedF32Bits { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedF64Bits { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedUuid { validity, .. } => validity.set(row_idx, is_valid),
+            ColumnData::FixedTimestampMicros { validity, .. } => validity.set(row_idx, is_valid),
             ColumnData::Var { validity, .. } => validity.set(row_idx, is_valid),
         }
     }
 
     fn validity_bytes(&self) -> &[u8] {
         match self {
-            ColumnData::Fixed { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedBool { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedI16 { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedI32 { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedI64 { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedF32Bits { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedF64Bits { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedUuid { validity, .. } => validity.as_bytes(),
+            ColumnData::FixedTimestampMicros { validity, .. } => validity.as_bytes(),
             ColumnData::Var { validity, .. } => validity.as_bytes(),
         }
     }
 
-    fn fixed_values_bytes(&self) -> Option<&[u8]> {
+    fn fixed_values_len(&self) -> Option<usize> {
         match self {
-            ColumnData::Fixed { values, .. } => Some(values.as_slice()),
+            ColumnData::FixedBool { values, .. } => Some(values.len()),
+            ColumnData::FixedI16 { values, .. } => Some(values.len()),
+            ColumnData::FixedI32 { values, .. } => Some(values.len()),
+            ColumnData::FixedI64 { values, .. } => Some(values.len()),
+            ColumnData::FixedF32Bits { values, .. } => Some(values.len()),
+            ColumnData::FixedF64Bits { values, .. } => Some(values.len()),
+            ColumnData::FixedUuid { values, .. } => Some(values.len()),
+            ColumnData::FixedTimestampMicros { values, .. } => Some(values.len()),
             ColumnData::Var { .. } => None,
         }
     }
@@ -255,7 +319,7 @@ impl ColumnData {
     fn var_slices(&self) -> Option<(&[u32], &[u8])> {
         match self {
             ColumnData::Var { offsets, data, .. } => Some((offsets.as_slice(), data.as_slice())),
-            ColumnData::Fixed { .. } => None,
+            _ => None,
         }
     }
 }
@@ -310,11 +374,71 @@ impl ColumnarBatch {
     }
 
     pub fn fixed_values_bytes(&self, idx: usize) -> Option<&[u8]> {
-        self.columns.get(idx).and_then(|c| c.fixed_values_bytes())
+        // This crate currently exposes typed accessors for fixed-width columns.
+        // Keep `fixed_values_bytes` only for compatibility with earlier code paths,
+        // by returning None.
+        let _ = idx;
+        None
     }
 
-    pub fn fixed_encoding(&self, idx: usize) -> Option<FixedEncoding> {
-        self.columns.get(idx).and_then(|c| c.fixed_encoding())
+    pub fn fixed_values_len(&self, idx: usize) -> Option<usize> {
+        self.columns.get(idx).and_then(|c| c.fixed_values_len())
+    }
+
+    pub fn fixed_bool_bytes(&self, idx: usize) -> Option<&[u8]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedBool { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_i16(&self, idx: usize) -> Option<&[i16]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedI16 { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_i32(&self, idx: usize) -> Option<&[i32]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedI32 { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_i64(&self, idx: usize) -> Option<&[i64]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedI64 { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_f32_bits(&self, idx: usize) -> Option<&[u32]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedF32Bits { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_f64_bits(&self, idx: usize) -> Option<&[u64]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedF64Bits { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_uuid_bytes(&self, idx: usize) -> Option<&[[u8; 16]]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedUuid { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn fixed_timestamp_micros(&self, idx: usize) -> Option<&[i64]> {
+        match self.columns.get(idx)? {
+            ColumnData::FixedTimestampMicros { values, .. } => Some(values.as_slice()),
+            _ => None,
+        }
     }
 
     pub fn var_slices(&self, idx: usize) -> Option<(&[u32], &[u8])> {
@@ -351,13 +475,14 @@ impl ColumnarBatch {
 
         col.set_validity(row_idx, false)?;
         match col {
-            ColumnData::Fixed { width, values, .. } => {
-                let start = values.len();
-                let new_len = start
-                    .checked_add(*width)
-                    .ok_or_else(|| Error::Other("fixed column size overflow".to_string()))?;
-                values.resize(new_len, 0);
-            }
+            ColumnData::FixedBool { values, .. } => values.push(0),
+            ColumnData::FixedI16 { values, .. } => values.push(0),
+            ColumnData::FixedI32 { values, .. } => values.push(0),
+            ColumnData::FixedI64 { values, .. } => values.push(0),
+            ColumnData::FixedF32Bits { values, .. } => values.push(0),
+            ColumnData::FixedF64Bits { values, .. } => values.push(0),
+            ColumnData::FixedUuid { values, .. } => values.push([0u8; 16]),
+            ColumnData::FixedTimestampMicros { values, .. } => values.push(0),
             ColumnData::Var { offsets, data, .. } => {
                 let len_u32: u32 = data
                     .len()
@@ -369,33 +494,100 @@ impl ColumnarBatch {
         Ok(())
     }
 
-    pub fn push_fixed_bytes(&mut self, col_idx: usize, bytes: &[u8], encoding: FixedEncoding) -> Result<()> {
+    pub fn push_bool(&mut self, col_idx: usize, v: bool) -> Result<()> {
         let row_idx = self.row_count;
-        if row_idx >= self.row_capacity {
-            return Err(Error::Other("columnar batch is full".to_string()));
-        }
         let col = self
             .columns
             .get_mut(col_idx)
             .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
-
         col.set_validity(row_idx, true)?;
         match col {
-            ColumnData::Fixed {
-                width,
-                encoding: enc,
-                values,
-                ..
-            } => {
-                if bytes.len() != *width {
-                    return Err(Error::Other("fixed-width byte length mismatch".to_string()));
-                }
-                *enc = encoding;
-                values.extend_from_slice(bytes);
+            ColumnData::FixedBool { values, .. } => {
+                values.push(if v { 1 } else { 0 });
+                Ok(())
             }
-            _ => return Err(Error::Other("expected fixed-width column".to_string())),
+            _ => Err(Error::Other("expected BOOL column".to_string())),
         }
-        Ok(())
+    }
+
+    pub fn push_i64(&mut self, col_idx: usize, v: i64) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedI64 { values, .. } => {
+                values.push(v);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected I64 column".to_string())),
+        }
+    }
+
+    pub fn push_i32(&mut self, col_idx: usize, v: i32) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedI32 { values, .. } => {
+                values.push(v);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected I32 column".to_string())),
+        }
+    }
+
+    pub fn push_f64_bits(&mut self, col_idx: usize, bits: u64) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedF64Bits { values, .. } => {
+                values.push(bits);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected F64 column".to_string())),
+        }
+    }
+
+    pub fn push_uuid_bytes(&mut self, col_idx: usize, bytes16: [u8; 16]) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedUuid { values, .. } => {
+                values.push(bytes16);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected UUID column".to_string())),
+        }
+    }
+
+    pub fn push_timestamp_micros(&mut self, col_idx: usize, micros: i64) -> Result<()> {
+        let row_idx = self.row_count;
+        let col = self
+            .columns
+            .get_mut(col_idx)
+            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
+        col.set_validity(row_idx, true)?;
+        match col {
+            ColumnData::FixedTimestampMicros { values, .. } => {
+                values.push(micros);
+                Ok(())
+            }
+            _ => Err(Error::Other("expected TIMESTAMPTZ micros column".to_string())),
+        }
     }
 
     pub fn push_utf8(&mut self, col_idx: usize, s: &str) -> Result<()> {
@@ -511,22 +703,6 @@ impl<'c> CopyBinaryBatchReader<'c> {
         }
 
         out.prepare(out.row_capacity())?;
-        // Set fixed-width encoding once per column to avoid per-cell overhead.
-        for (i, col) in out.columns.iter_mut().enumerate() {
-            let Some(field) = out.schema.fields().get(i) else {
-                return Err(Error::Other("schema/column mismatch".to_string()));
-            };
-            if let ColumnData::Fixed { encoding, .. } = col {
-                *encoding = match field.ty {
-                    ColumnarType::I16
-                    | ColumnarType::I32
-                    | ColumnarType::I64
-                    | ColumnarType::F32
-                    | ColumnarType::F64 => FixedEncoding::PgBe,
-                    _ => FixedEncoding::Le,
-                };
-            }
-        }
 
         if !self.header_parsed {
             self.parse_header().await?;
@@ -609,13 +785,14 @@ impl<'c> CopyBinaryBatchReader<'c> {
         if is_null {
             col.set_validity(row_idx, false)?;
             match col {
-                ColumnData::Fixed { width, values, .. } => {
-                    let start = values.len();
-                    let new_len = start
-                        .checked_add(*width)
-                        .ok_or_else(|| Error::Other("fixed column size overflow".to_string()))?;
-                    values.resize(new_len, 0);
-                }
+                ColumnData::FixedBool { values, .. } => values.push(0),
+                ColumnData::FixedI16 { values, .. } => values.push(0),
+                ColumnData::FixedI32 { values, .. } => values.push(0),
+                ColumnData::FixedI64 { values, .. } => values.push(0),
+                ColumnData::FixedF32Bits { values, .. } => values.push(0),
+                ColumnData::FixedF64Bits { values, .. } => values.push(0),
+                ColumnData::FixedUuid { values, .. } => values.push([0u8; 16]),
+                ColumnData::FixedTimestampMicros { values, .. } => values.push(0),
                 ColumnData::Var { offsets, data, .. } => {
                     let len_u32: u32 = data
                         .len()
@@ -636,60 +813,86 @@ impl<'c> CopyBinaryBatchReader<'c> {
 
         col.set_validity(row_idx, true)?;
         match col {
-            ColumnData::Fixed {
-                ty,
-                width,
-                values,
-                ..
-            } => {
-                if len_usize != *width {
-                    return Err(Error::Other(format!(
-                        "COPY field length mismatch for {ty:?}: got {len_usize}, expected {width}"
-                    )));
+            ColumnData::FixedBool { values, .. } => {
+                if len_usize != 1 {
+                    return Err(Error::Other("COPY field length mismatch for Bool".to_string()));
                 }
-                let bytes = self.read_slice(len_usize).await?;
-                match ty {
-                    ColumnarType::Bool => {
-                        values.push(bytes[0]);
-                    }
-                    ColumnarType::I16 => {
-                        values.extend_from_slice(bytes);
-                    }
-                    ColumnarType::I32 => {
-                        values.extend_from_slice(bytes);
-                    }
-                    ColumnarType::I64 => {
-                        values.extend_from_slice(bytes);
-                    }
-                    ColumnarType::F32 => {
-                        values.extend_from_slice(bytes);
-                    }
-                    ColumnarType::F64 => {
-                        values.extend_from_slice(bytes);
-                    }
-                    ColumnarType::Uuid => {
-                        values.extend_from_slice(bytes);
-                    }
-                    ColumnarType::TimestampTzMicros => {
-                        let pg_micros = i64::from_be_bytes([
-                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                            bytes[7],
-                        ]);
-                        if pg_micros == i64::MIN || pg_micros == i64::MAX {
-                            return Err(Error::Other(
-                                "timestamptz infinity is not supported".to_string(),
-                            ));
-                        }
-                        const UNIX_TO_PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
-                        let unix_micros = pg_micros
-                            .checked_add(UNIX_TO_PG_EPOCH_MICROS)
-                            .ok_or_else(|| Error::Other("timestamp overflow".to_string()))?;
-                        values.extend_from_slice(&unix_micros.to_le_bytes());
-                    }
-                    ColumnarType::Utf8 | ColumnarType::Bytes => {
-                        return Err(Error::Other("internal type mismatch".to_string()));
-                    }
+                let bytes = self.read_slice(1).await?;
+                values.push(bytes[0]);
+                self.maybe_compact();
+            }
+            ColumnData::FixedI16 { values, .. } => {
+                if len_usize != 2 {
+                    return Err(Error::Other("COPY field length mismatch for I16".to_string()));
                 }
+                let b = self.read_slice(2).await?;
+                values.push(i16::from_be_bytes([b[0], b[1]]));
+                self.maybe_compact();
+            }
+            ColumnData::FixedI32 { values, .. } => {
+                if len_usize != 4 {
+                    return Err(Error::Other("COPY field length mismatch for I32".to_string()));
+                }
+                let b = self.read_slice(4).await?;
+                values.push(i32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+                self.maybe_compact();
+            }
+            ColumnData::FixedI64 { values, .. } => {
+                if len_usize != 8 {
+                    return Err(Error::Other("COPY field length mismatch for I64".to_string()));
+                }
+                let b = self.read_slice(8).await?;
+                values.push(i64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]));
+                self.maybe_compact();
+            }
+            ColumnData::FixedF32Bits { values, .. } => {
+                if len_usize != 4 {
+                    return Err(Error::Other("COPY field length mismatch for F32".to_string()));
+                }
+                let b = self.read_slice(4).await?;
+                values.push(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+                self.maybe_compact();
+            }
+            ColumnData::FixedF64Bits { values, .. } => {
+                if len_usize != 8 {
+                    return Err(Error::Other("COPY field length mismatch for F64".to_string()));
+                }
+                let b = self.read_slice(8).await?;
+                values.push(u64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]));
+                self.maybe_compact();
+            }
+            ColumnData::FixedUuid { values, .. } => {
+                if len_usize != 16 {
+                    return Err(Error::Other("COPY field length mismatch for UUID".to_string()));
+                }
+                let b = self.read_slice(16).await?;
+                let mut v = [0u8; 16];
+                v.copy_from_slice(b);
+                values.push(v);
+                self.maybe_compact();
+            }
+            ColumnData::FixedTimestampMicros { values, .. } => {
+                if len_usize != 8 {
+                    return Err(Error::Other(
+                        "COPY field length mismatch for TimestampTz".to_string(),
+                    ));
+                }
+                let b = self.read_slice(8).await?;
+                let pg_micros = i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                if pg_micros == i64::MIN || pg_micros == i64::MAX {
+                    return Err(Error::Other(
+                        "timestamptz infinity is not supported".to_string(),
+                    ));
+                }
+                const UNIX_TO_PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
+                let unix_micros = pg_micros
+                    .checked_add(UNIX_TO_PG_EPOCH_MICROS)
+                    .ok_or_else(|| Error::Other("timestamp overflow".to_string()))?;
+                values.push(unix_micros);
                 self.maybe_compact();
             }
             ColumnData::Var { ty, data, .. } => {

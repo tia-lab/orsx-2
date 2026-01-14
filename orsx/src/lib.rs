@@ -16,7 +16,7 @@ pub use schema::{ColumnSpec, OrsxMigrate, TableSpec};
 pub use types::FieldType;
 pub use compressed::{Compressed, CompressedWorkspace};
 pub use columnar::{
-    ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader, FixedEncoding,
+    ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader,
 };
 
 pub use sqlx;
@@ -35,7 +35,6 @@ pub mod prelude {
     pub use crate::{Compressed, CompressedWorkspace};
     pub use crate::{
         ColumnarBatch, ColumnarField, ColumnarSchema, ColumnarType, CopyBinaryBatchReader,
-        FixedEncoding,
     };
     pub use crate::Timestamp;
     pub use crate::SqlxTimestamp;

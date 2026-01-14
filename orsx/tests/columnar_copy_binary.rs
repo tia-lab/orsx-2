@@ -1,6 +1,6 @@
 use orsx::columnar::{
     ColumnarBatch, ColumnarField, ColumnarReadConfig, ColumnarSchema, ColumnarType,
-    CopyBinaryBatchReader, FixedEncoding,
+    CopyBinaryBatchReader,
 };
 use orsx::SqlxTimestamp;
 use sqlx::{Connection, Executor};
@@ -10,32 +10,6 @@ fn validity_get(validity: &[u8], row: usize) -> bool {
     let byte = validity[row / 8];
     let bit = 1u8 << (row % 8);
     (byte & bit) != 0
-}
-
-fn fixed_at(bytes: &[u8], width: usize, row: usize) -> &[u8] {
-    let start = row * width;
-    &bytes[start..start + width]
-}
-
-fn i64_from(bytes: &[u8], enc: FixedEncoding) -> i64 {
-    match enc {
-        FixedEncoding::Le => i64::from_le_bytes(bytes.try_into().unwrap()),
-        FixedEncoding::PgBe => i64::from_be_bytes(bytes.try_into().unwrap()),
-    }
-}
-
-fn i32_from(bytes: &[u8], enc: FixedEncoding) -> i32 {
-    match enc {
-        FixedEncoding::Le => i32::from_le_bytes(bytes.try_into().unwrap()),
-        FixedEncoding::PgBe => i32::from_be_bytes(bytes.try_into().unwrap()),
-    }
-}
-
-fn f64_from(bytes: &[u8], enc: FixedEncoding) -> f64 {
-    match enc {
-        FixedEncoding::Le => f64::from_le_bytes(bytes.try_into().unwrap()),
-        FixedEncoding::PgBe => f64::from_be_bytes(bytes.try_into().unwrap()),
-    }
 }
 
 #[tokio::test]
@@ -156,11 +130,10 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // id
     {
         let validity = batch.column_validity_bytes(0).unwrap();
-        let values = batch.fixed_values_bytes(0).unwrap();
-        let enc = batch.fixed_encoding(0).unwrap();
+        let values = batch.fixed_i64(0).unwrap();
         for (row, (id, ..)) in expected.iter().enumerate() {
             assert!(validity_get(validity, row));
-            let got = i64_from(fixed_at(values, 8, row), enc);
+            let got = values[row];
             assert_eq!(got, *id);
         }
     }
@@ -168,12 +141,12 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // b
     {
         let validity = batch.column_validity_bytes(1).unwrap();
-        let values = batch.fixed_values_bytes(1).unwrap();
+        let values = batch.fixed_bool_bytes(1).unwrap();
         for (row, (_, b, ..)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, b.is_some());
             if let Some(v) = b {
-                let got = fixed_at(values, 1, row)[0] != 0;
+                let got = values[row] != 0;
                 assert_eq!(got, *v);
             }
         }
@@ -182,13 +155,12 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // i32
     {
         let validity = batch.column_validity_bytes(2).unwrap();
-        let values = batch.fixed_values_bytes(2).unwrap();
-        let enc = batch.fixed_encoding(2).unwrap();
+        let values = batch.fixed_i32(2).unwrap();
         for (row, (_, _, i32v, ..)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, i32v.is_some());
             if let Some(v) = i32v {
-                let got = i32_from(fixed_at(values, 4, row), enc);
+                let got = values[row];
                 assert_eq!(got, *v);
             }
         }
@@ -197,13 +169,12 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // f64
     {
         let validity = batch.column_validity_bytes(3).unwrap();
-        let values = batch.fixed_values_bytes(3).unwrap();
-        let enc = batch.fixed_encoding(3).unwrap();
+        let values = batch.fixed_f64_bits(3).unwrap();
         for (row, (_, _, _, f64v, ..)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, f64v.is_some());
             if let Some(v) = f64v {
-                let got = f64_from(fixed_at(values, 8, row), enc);
+                let got = f64::from_bits(values[row]);
                 assert_eq!(got, *v);
             }
         }
@@ -212,12 +183,12 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // uuid
     {
         let validity = batch.column_validity_bytes(4).unwrap();
-        let values = batch.fixed_values_bytes(4).unwrap();
+        let values = batch.fixed_uuid_bytes(4).unwrap();
         for (row, (_, _, _, _, u, ..)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, u.is_some());
             if let Some(v) = u {
-                let got = Uuid::from_slice(fixed_at(values, 16, row)).unwrap();
+                let got = Uuid::from_slice(values[row].as_slice()).unwrap();
                 assert_eq!(got, *v);
             }
         }
@@ -226,13 +197,12 @@ async fn columnar_copy_binary_matches_row_wise_for_mixed_types() {
     // timestamptz micros
     {
         let validity = batch.column_validity_bytes(5).unwrap();
-        let values = batch.fixed_values_bytes(5).unwrap();
-        let enc = batch.fixed_encoding(5).unwrap();
+        let values = batch.fixed_timestamp_micros(5).unwrap();
         for (row, (_, _, _, _, _, ts, ..)) in expected.iter().enumerate() {
             let is_valid = validity_get(validity, row);
             assert_eq!(is_valid, ts.is_some());
             if let Some(v) = ts {
-                let got = i64_from(fixed_at(values, 8, row), enc);
+                let got = values[row];
                 assert_eq!(got, *v);
             }
         }
