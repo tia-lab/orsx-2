@@ -67,6 +67,27 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| match s.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
+            "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn cfg_from_env(mut cfg: MigrationConfig) -> MigrationConfig {
+    let adaptive = env_bool("ORSX_ADAPTIVE_CHUNK", false);
+    cfg.adaptive_chunk = adaptive;
+    cfg.online_chunk_size_min = env_u64("ORSX_CHUNK_MIN", cfg.online_chunk_size_min as u64) as i64;
+    cfg.online_chunk_size_max = env_u64("ORSX_CHUNK_MAX", cfg.online_chunk_size_max as u64) as i64;
+    cfg.online_target_batch_ms = env_u64("ORSX_TARGET_BATCH_MS", cfg.online_target_batch_ms);
+    cfg.online_max_batch_ms = env_u64("ORSX_MAX_BATCH_MS", cfg.online_max_batch_ms);
+    cfg
+}
+
 async fn create_base_table_wrong_order(pool: &sqlx::PgPool, table: &str) {
     // Ensure UUID generator is available.
     sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "uuid-ossp""#)
@@ -231,7 +252,7 @@ async fn big_table_compare_default_vs_strict_enforcement() {
     create_base_table_wrong_order(&pool, &default_table).await;
     let seed_def = seed_rows(&pool, &default_table, rows).await;
 
-    let default_cfg = MigrationConfig::default();
+    let default_cfg = cfg_from_env(MigrationConfig::default());
     let dummy1 = BigCmpSpec {
         id: Uuid::new_v4(),
         c01: 0,
@@ -296,13 +317,13 @@ async fn big_table_compare_default_vs_strict_enforcement() {
     create_base_table_wrong_order(&pool, &strict_table).await;
     let seed_str = seed_rows(&pool, &strict_table, rows).await;
 
-    let strict_cfg = MigrationConfig {
+    let strict_cfg = cfg_from_env(MigrationConfig {
         enforce_column_order: true,
         enforce_exact_columns: true,
         allow_destructive_drops: true,
         online_chunk_size: 20_000,
         ..MigrationConfig::default()
-    };
+    });
 
     let dummy2 = BigCmpSpec {
         id: Uuid::new_v4(),
@@ -390,4 +411,13 @@ async fn big_table_compare_default_vs_strict_enforcement() {
     println!("rows={rows}");
     println!("default: seed={:?} migrate={:?}", seed_def, mig_def);
     println!("strict:  seed={:?} migrate={:?}", seed_str, mig_str);
+    println!(
+        "cfg: adaptive_chunk={} chunk_size={} min={} max={} target_ms={} max_ms={}",
+        strict_cfg.adaptive_chunk,
+        strict_cfg.online_chunk_size,
+        strict_cfg.online_chunk_size_min,
+        strict_cfg.online_chunk_size_max,
+        strict_cfg.online_target_batch_ms,
+        strict_cfg.online_max_batch_ms
+    );
 }

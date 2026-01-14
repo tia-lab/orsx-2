@@ -13,6 +13,14 @@ pub struct MigrationConfig {
     pub allow_destructive_drops: bool,
     /// Allow `#[orsx_column(rename_from = \"...\")]` to rename columns using `ALTER TABLE ... RENAME COLUMN ...`.
     pub allow_column_renames: bool,
+
+    /// Opt-in adaptive chunk sizing for online changelog catch-up.
+    /// This trades execution determinism for throughput (chunk sizes depend on runtime timings).
+    pub adaptive_chunk: bool,
+    pub online_chunk_size_min: i64,
+    pub online_chunk_size_max: i64,
+    pub online_target_batch_ms: u64,
+    pub online_max_batch_ms: u64,
 }
 
 impl Default for MigrationConfig {
@@ -27,6 +35,11 @@ impl Default for MigrationConfig {
             enforce_exact_columns: false,
             allow_destructive_drops: false,
             allow_column_renames: true,
+            adaptive_chunk: false,
+            online_chunk_size_min: 10_000,
+            online_chunk_size_max: 200_000,
+            online_target_batch_ms: 250,
+            online_max_batch_ms: 2_000,
         }
     }
 }

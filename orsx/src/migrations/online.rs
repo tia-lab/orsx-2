@@ -10,6 +10,81 @@ struct CutoverStats {
     lock_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveChunk {
+    enabled: bool,
+    min: i64,
+    max: i64,
+    target_ms: u64,
+    max_ms: u64,
+}
+
+impl AdaptiveChunk {
+    fn from_cfg(cfg: &MigrationConfig) -> Result<Self> {
+        let mut min = cfg.online_chunk_size_min;
+        let mut max = cfg.online_chunk_size_max;
+        if min <= 0 || max <= 0 {
+            return Err(Error::Other(
+                "online chunk size bounds must be positive".to_string(),
+            ));
+        }
+        if min > max {
+            std::mem::swap(&mut min, &mut max);
+        }
+        Ok(Self {
+            enabled: cfg.adaptive_chunk,
+            min,
+            max,
+            target_ms: cfg.online_target_batch_ms.max(1),
+            max_ms: cfg.online_max_batch_ms.max(cfg.online_target_batch_ms.max(1)),
+        })
+    }
+
+    fn clamp_size(&self, v: i64) -> i64 {
+        v.clamp(self.min, self.max)
+    }
+
+    fn adjust(&self, current: i64, batch_ms: u64) -> i64 {
+        if !self.enabled {
+            return current;
+        }
+        let current = self.clamp_size(current);
+        let batch_ms = batch_ms.max(1);
+        if batch_ms >= self.max_ms {
+            return self.clamp_size(current.saturating_div(2).max(1));
+        }
+
+        // Use a proportional controller with a deadband around the target to avoid oscillation.
+        //
+        // Why not doubling/halving? On large tables, bigger batches can quickly hit WAL/IO ceilings,
+        // and oscillation wastes time. This converges smoothly by scaling towards target_ms but
+        // limits per-step change.
+        let low = (self.target_ms * 85) / 100;
+        let high = (self.target_ms * 115) / 100;
+        if (low..=high).contains(&batch_ms) {
+            return current;
+        }
+
+        let target = self.target_ms as i128;
+        let batch = batch_ms as i128;
+        let cur = current as i128;
+
+        // Ideal proportional size: current * target / batch.
+        let mut next = (cur.saturating_mul(target)).saturating_div(batch).max(1);
+
+        // Limit per-step change to keep behavior stable.
+        let min_step = (cur * 2) / 3; // -33%
+        let max_step = (cur * 3) / 2; // +50%
+        if next < min_step {
+            next = min_step.max(1);
+        } else if next > max_step {
+            next = max_step.max(1);
+        }
+
+        self.clamp_size(next as i64)
+    }
+}
+
 pub async fn online_rewrite_table(
     pool: &PgPool,
     table_name: &str,
@@ -302,13 +377,17 @@ async fn backfill(
     let mut total_rows: u64 = 0;
     let mut last_pk: Option<String> = None;
 
-    let select_initial = format!(
-        "SELECT {pk_q}::text FROM {src} ORDER BY {pk_q} LIMIT $1",
+    // Determine the batch boundary (max pk) using an index-friendly subquery, then copy the whole range.
+    // This avoids allocating large PK arrays and reduces round-trips/CPU overhead at scale.
+    // UUIDs are orderable (btree) but do not support MAX(uuid) aggregate in Postgres.
+    // Use ORDER BY DESC LIMIT 1 instead.
+    let select_last_initial = format!(
+        "SELECT {pk_q}::text FROM (SELECT {pk_q} FROM {src} ORDER BY {pk_q} LIMIT $1) s ORDER BY {pk_q} DESC LIMIT 1",
         pk_q = pk_q,
         src = quote_identifier(source),
     );
-    let select_next = format!(
-        "SELECT {pk_q}::text FROM {src} WHERE {pk_q} > ($1::{pk_cast}) ORDER BY {pk_q} LIMIT $2",
+    let select_last_next = format!(
+        "SELECT {pk_q}::text FROM (SELECT {pk_q} FROM {src} WHERE {pk_q} > ($1::{pk_cast}) ORDER BY {pk_q} LIMIT $2) s ORDER BY {pk_q} DESC LIMIT 1",
         pk_q = pk_q,
         src = quote_identifier(source),
         pk_cast = pk_cast,
@@ -335,10 +414,10 @@ async fn backfill(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let insert_only = format!(
+    let insert_initial = format!(
         "INSERT INTO {shadow} ({columns}) \
          SELECT {values} FROM {src} AS src \
-         WHERE {pk_q} = ANY($1::{pk_cast}[]) \
+         WHERE src.{pk_q} <= ($1::{pk_cast}) \
          ON CONFLICT ({pk_q}) DO NOTHING",
         shadow = quote_identifier(shadow),
         src = quote_identifier(source),
@@ -348,30 +427,60 @@ async fn backfill(
         pk_cast = pk_cast,
     );
 
+    let insert_range = format!(
+        "INSERT INTO {shadow} ({columns}) \
+         SELECT {values} FROM {src} AS src \
+         WHERE src.{pk_q} > ($1::{pk_cast}) AND src.{pk_q} <= ($2::{pk_cast}) \
+         ON CONFLICT ({pk_q}) DO NOTHING",
+        shadow = quote_identifier(shadow),
+        src = quote_identifier(source),
+        pk_q = pk_q,
+        columns = columns,
+        values = values,
+        pk_cast = pk_cast,
+    );
+
+    // Backfill is the dominant cost for large tables and is typically stable.
+    // Keeping a fixed chunk size avoids oscillation and makes perf easier to reason about.
+    let chunk_size = cfg.online_chunk_size.max(1);
     loop {
-        // Keyset pagination with parameter cast (keeps index usability).
-        let batch: Vec<(String,)> = if let Some(ref lp) = last_pk {
-            sqlx::query_as(&select_next)
+        let next_last: Option<String> = if let Some(ref lp) = last_pk {
+            sqlx::query_scalar(&select_last_next)
                 .bind(lp)
-                .bind(cfg.online_chunk_size)
-                .fetch_all(pool)
+                .bind(chunk_size)
+                .fetch_optional(pool)
                 .await?
         } else {
-            sqlx::query_as(&select_initial)
-                .bind(cfg.online_chunk_size)
-                .fetch_all(pool)
+            sqlx::query_scalar(&select_last_initial)
+                .bind(chunk_size)
+                .fetch_optional(pool)
                 .await?
         };
 
-        if batch.is_empty() {
+        let Some(next_last) = next_last else {
             break;
-        }
+        };
 
-        let pks: Vec<String> = batch.into_iter().map(|t| t.0).collect();
-        last_pk = pks.last().cloned();
-        total_rows = total_rows.saturating_add(pks.len() as u64);
+        let batch_start = Instant::now();
+        let inserted = if let Some(ref lp) = last_pk {
+            sqlx::query(&insert_range)
+                .bind(lp)
+                .bind(&next_last)
+                .execute(pool)
+                .await?
+                .rows_affected()
+        } else {
+            sqlx::query(&insert_initial)
+                .bind(&next_last)
+                .execute(pool)
+                .await?
+                .rows_affected()
+        };
+        let batch_ms = batch_start.elapsed().as_millis() as u64;
 
-        sqlx::query(&insert_only).bind(&pks).execute(pool).await?;
+        total_rows = total_rows.saturating_add(inserted as u64);
+        last_pk = Some(next_last);
+        let _ = batch_ms; // reserved for future backfill-specific tuning knobs
 
         if cfg.online_sleep_ms > 0 {
             tokio::time::sleep(Duration::from_millis(cfg.online_sleep_ms)).await;
@@ -391,8 +500,10 @@ async fn catch_up_best_effort(
     col_exprs: &[(&'static str, String)],
     cfg: &MigrationConfig,
 ) -> Result<u64> {
+    let adaptive = AdaptiveChunk::from_cfg(cfg)?;
     let pk_q = quote_identifier(pk);
     let pk_cast = cast_type_for_param(pk_sql_type)?;
+    let changelog_q = quote_identifier(changelog);
     let columns = col_exprs
         .iter()
         .map(|(c, _)| quote_identifier(c))
@@ -423,36 +534,159 @@ async fn catch_up_best_effort(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut drained_total: u64 = 0;
-    for _round in 0..cfg.max_online_catchup_rounds {
-        let pks: Vec<(String,)> = sqlx::query_as(&format!(
-            "SELECT pk::text FROM {} ORDER BY pk::text LIMIT $1",
-            quote_identifier(changelog)
-        ))
-        .bind(cfg.online_chunk_size)
-        .fetch_all(pool)
-        .await?;
+    // Range boundary selection from changelog (order by typed pk, return boundary as text).
+    let select_last_initial = format!(
+        "SELECT pk::text FROM (SELECT pk FROM {changelog} ORDER BY pk LIMIT $1) s ORDER BY pk DESC LIMIT 1",
+        changelog = changelog_q
+    );
+    let select_last_next = format!(
+        "SELECT pk::text FROM (SELECT pk FROM {changelog} WHERE pk > ($1::{pk_cast}) ORDER BY pk LIMIT $2) s ORDER BY pk DESC LIMIT 1",
+        changelog = changelog_q,
+        pk_cast = pk_cast,
+    );
 
-        if pks.is_empty() {
+    let mut drained_total: u64 = 0;
+    let mut last_pk: Option<String> = None;
+    let mut chunk_size = adaptive.clamp_size(cfg.online_chunk_size);
+    for _round in 0..cfg.max_online_catchup_rounds {
+        let next_last: Option<String> = if let Some(ref lp) = last_pk {
+            sqlx::query_scalar(&select_last_next)
+                .bind(lp)
+                .bind(chunk_size)
+                .fetch_optional(pool)
+                .await?
+        } else {
+            sqlx::query_scalar(&select_last_initial)
+                .bind(chunk_size)
+                .fetch_optional(pool)
+                .await?
+        };
+
+        let Some(next_last) = next_last else {
             return Ok(drained_total);
+        };
+
+        let upsert = if last_pk.is_some() {
+            format!(
+                "INSERT INTO {shadow} ({columns}) \
+                 SELECT {values} \
+                   FROM {src} AS src \
+                   JOIN {changelog} c ON c.pk = src.{pk_q} \
+                  WHERE c.pk > ($1::{pk_cast}) AND c.pk <= ($2::{pk_cast}) \
+                 {on_conflict}",
+                shadow = quote_identifier(shadow),
+                src = quote_identifier(source),
+                changelog = changelog_q,
+                columns = columns,
+                values = values,
+                pk_q = pk_q,
+                pk_cast = pk_cast,
+                on_conflict = on_conflict_clause(&pk_q, &set_parts),
+            )
+        } else {
+            format!(
+                "INSERT INTO {shadow} ({columns}) \
+                 SELECT {values} \
+                   FROM {src} AS src \
+                   JOIN {changelog} c ON c.pk = src.{pk_q} \
+                  WHERE c.pk <= ($1::{pk_cast}) \
+                 {on_conflict}",
+                shadow = quote_identifier(shadow),
+                src = quote_identifier(source),
+                changelog = changelog_q,
+                columns = columns,
+                values = values,
+                pk_q = pk_q,
+                pk_cast = pk_cast,
+                on_conflict = on_conflict_clause(&pk_q, &set_parts),
+            )
+        };
+
+        let batch_start = Instant::now();
+        if let Some(ref lp) = last_pk {
+            sqlx::query(&upsert)
+                .bind(lp)
+                .bind(&next_last)
+                .execute(pool)
+                .await?;
+        } else {
+            sqlx::query(&upsert).bind(&next_last).execute(pool).await?;
         }
 
-        let pk_values: Vec<String> = pks.into_iter().map(|t| t.0).collect();
-        drained_total = drained_total.saturating_add(pk_values.len() as u64);
+        let delete_missing = if last_pk.is_some() {
+            format!(
+                "DELETE FROM {shadow} s \
+                  USING {changelog} c \
+                 WHERE c.pk = s.{pk_q} \
+                   AND c.pk > ($1::{pk_cast}) AND c.pk <= ($2::{pk_cast}) \
+                   AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
+                shadow = quote_identifier(shadow),
+                changelog = changelog_q,
+                src = quote_identifier(source),
+                pk_q = pk_q,
+                pk_cast = pk_cast,
+            )
+        } else {
+            format!(
+                "DELETE FROM {shadow} s \
+                  USING {changelog} c \
+                 WHERE c.pk = s.{pk_q} \
+                   AND c.pk <= ($1::{pk_cast}) \
+                   AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
+                shadow = quote_identifier(shadow),
+                changelog = changelog_q,
+                src = quote_identifier(source),
+                pk_q = pk_q,
+                pk_cast = pk_cast,
+            )
+        };
 
-        apply_changelog_batch(
-            pool,
-            source,
-            shadow,
-            changelog,
-            &pk_values,
-            &pk_q,
-            pk_cast,
-            &columns,
-            &values,
-            &set_parts,
-        )
-        .await?;
+        if let Some(ref lp) = last_pk {
+            sqlx::query(&delete_missing)
+                .bind(lp)
+                .bind(&next_last)
+                .execute(pool)
+                .await?;
+        } else {
+            sqlx::query(&delete_missing)
+                .bind(&next_last)
+                .execute(pool)
+                .await?;
+        }
+
+        let clear = if last_pk.is_some() {
+            format!(
+                "DELETE FROM {changelog} WHERE pk > ($1::{pk_cast}) AND pk <= ($2::{pk_cast})",
+                changelog = changelog_q,
+                pk_cast = pk_cast
+            )
+        } else {
+            format!(
+                "DELETE FROM {changelog} WHERE pk <= ($1::{pk_cast})",
+                changelog = changelog_q,
+                pk_cast = pk_cast
+            )
+        };
+
+        let cleared = if let Some(ref lp) = last_pk {
+            sqlx::query(&clear)
+                .bind(lp)
+                .bind(&next_last)
+                .execute(pool)
+                .await?
+                .rows_affected()
+        } else {
+            sqlx::query(&clear)
+                .bind(&next_last)
+                .execute(pool)
+                .await?
+                .rows_affected()
+        };
+        let batch_ms = batch_start.elapsed().as_millis() as u64;
+
+        drained_total = drained_total.saturating_add(cleared as u64);
+        last_pk = Some(next_last);
+        chunk_size = adaptive.adjust(chunk_size, batch_ms);
 
         if cfg.online_sleep_ms > 0 {
             tokio::time::sleep(Duration::from_millis(cfg.online_sleep_ms)).await;
@@ -500,6 +734,7 @@ async fn cutover(
     // Final drain inside lock (trigger dropped, so it must converge).
     let pk_q = quote_identifier(pk);
     let pk_cast = cast_type_for_param(pk_sql_type)?;
+    let changelog_q = quote_identifier(changelog);
 
     let columns = col_exprs
         .iter()
@@ -531,37 +766,73 @@ async fn cutover(
         .collect::<Vec<_>>()
         .join(", ");
 
+    let select_last_initial = format!(
+        "SELECT pk::text FROM (SELECT pk FROM {changelog} ORDER BY pk LIMIT $1) s ORDER BY pk DESC LIMIT 1",
+        changelog = changelog_q
+    );
+
     for _round in 0..cfg.max_online_catchup_rounds {
-        let pks: Vec<(String,)> = sqlx::query_as(&format!(
-            "SELECT pk::text FROM {} ORDER BY pk::text LIMIT $1",
-            quote_identifier(changelog)
-        ))
-        .bind(cfg.online_chunk_size)
-        .fetch_all(tx.as_mut())
-        .await?;
-        if pks.is_empty() {
+        let next_last: Option<String> = sqlx::query_scalar(&select_last_initial)
+            .bind(cfg.online_chunk_size)
+            .fetch_optional(tx.as_mut())
+            .await?;
+        let Some(next_last) = next_last else {
             break;
-        }
-        let pk_values: Vec<String> = pks.into_iter().map(|t| t.0).collect();
-        apply_changelog_batch_tx(
-            &mut tx,
-            source,
-            shadow,
-            changelog,
-            &pk_values,
-            &pk_q,
-            pk_cast,
-            &columns,
-            &values,
-            &set_parts,
-        )
-        .await?;
+        };
+
+        let upsert = format!(
+            "INSERT INTO {shadow} ({columns}) \
+             SELECT {values} \
+               FROM {src} AS src \
+               JOIN {changelog} c ON c.pk = src.{pk_q} \
+              WHERE c.pk <= ($1::{pk_cast}) \
+             {on_conflict}",
+            shadow = quote_identifier(shadow),
+            src = quote_identifier(source),
+            changelog = changelog_q,
+            columns = columns,
+            values = values,
+            pk_q = pk_q,
+            pk_cast = pk_cast,
+            on_conflict = on_conflict_clause(&pk_q, &set_parts),
+        );
+        sqlx::query(&upsert)
+            .bind(&next_last)
+            .execute(tx.as_mut())
+            .await?;
+
+        let delete_missing = format!(
+            "DELETE FROM {shadow} s \
+              USING {changelog} c \
+             WHERE c.pk = s.{pk_q} \
+               AND c.pk <= ($1::{pk_cast}) \
+               AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
+            shadow = quote_identifier(shadow),
+            changelog = changelog_q,
+            src = quote_identifier(source),
+            pk_q = pk_q,
+            pk_cast = pk_cast,
+        );
+        sqlx::query(&delete_missing)
+            .bind(&next_last)
+            .execute(tx.as_mut())
+            .await?;
+
+        let clear = format!(
+            "DELETE FROM {changelog} WHERE pk <= ($1::{pk_cast})",
+            changelog = changelog_q,
+            pk_cast = pk_cast,
+        );
+        sqlx::query(&clear)
+            .bind(&next_last)
+            .execute(tx.as_mut())
+            .await?;
     }
 
     // If still not empty, this violates the cutover safety contract.
     let remaining: (i64,) = sqlx::query_as(&format!(
         "SELECT COUNT(*)::BIGINT FROM {}",
-        quote_identifier(changelog)
+        changelog_q
     ))
     .fetch_one(tx.as_mut())
     .await?;
@@ -612,115 +883,8 @@ async fn cutover(
     })
 }
 
-async fn apply_changelog_batch(
-    pool: &PgPool,
-    source: &str,
-    shadow: &str,
-    changelog: &str,
-    pk_values: &[String],
-    pk_q: &str,
-    pk_cast: &str,
-    columns: &str,
-    values: &str,
-    set_parts: &str,
-) -> Result<()> {
-    let upsert = format!(
-        "INSERT INTO {shadow} ({columns}) \
-         SELECT {values} FROM {src} AS src \
-         WHERE {pk_q} = ANY($1::{pk_cast}[]) \
-         {on_conflict}",
-        shadow = quote_identifier(shadow),
-        src = quote_identifier(source),
-        pk_q = pk_q,
-        columns = columns,
-        values = values,
-        pk_cast = pk_cast,
-        on_conflict = on_conflict_clause(pk_q, set_parts),
-    );
-    sqlx::query(&upsert)
-        .bind(pk_values)
-        .execute(pool)
-        .await?;
-
-    let delete_missing = format!(
-        "DELETE FROM {shadow} s \
-         WHERE s.{pk_q} = ANY($1::{pk_cast}[]) \
-           AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
-        shadow = quote_identifier(shadow),
-        src = quote_identifier(source),
-        pk_q = pk_q,
-        pk_cast = pk_cast,
-    );
-    sqlx::query(&delete_missing)
-        .bind(pk_values)
-        .execute(pool)
-        .await?;
-
-    let clear = format!(
-        "DELETE FROM {} WHERE pk::text = ANY($1)",
-        quote_identifier(changelog)
-    );
-    sqlx::query(&clear)
-        .bind(pk_values)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-async fn apply_changelog_batch_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    source: &str,
-    shadow: &str,
-    changelog: &str,
-    pk_values: &[String],
-    pk_q: &str,
-    pk_cast: &str,
-    columns: &str,
-    values: &str,
-    set_parts: &str,
-) -> Result<()> {
-    let upsert = format!(
-        "INSERT INTO {shadow} ({columns}) \
-         SELECT {values} FROM {src} AS src \
-         WHERE {pk_q} = ANY($1::{pk_cast}[]) \
-         {on_conflict}",
-        shadow = quote_identifier(shadow),
-        src = quote_identifier(source),
-        pk_q = pk_q,
-        columns = columns,
-        values = values,
-        pk_cast = pk_cast,
-        on_conflict = on_conflict_clause(pk_q, set_parts),
-    );
-    sqlx::query(&upsert)
-        .bind(pk_values)
-        .execute(tx.as_mut())
-        .await?;
-
-    let delete_missing = format!(
-        "DELETE FROM {shadow} s \
-         WHERE s.{pk_q} = ANY($1::{pk_cast}[]) \
-           AND NOT EXISTS (SELECT 1 FROM {src} o WHERE o.{pk_q} = s.{pk_q})",
-        shadow = quote_identifier(shadow),
-        src = quote_identifier(source),
-        pk_q = pk_q,
-        pk_cast = pk_cast,
-    );
-    sqlx::query(&delete_missing)
-        .bind(pk_values)
-        .execute(tx.as_mut())
-        .await?;
-
-    let clear = format!(
-        "DELETE FROM {} WHERE pk::text = ANY($1)",
-        quote_identifier(changelog)
-    );
-    sqlx::query(&clear)
-        .bind(pk_values)
-        .execute(tx.as_mut())
-        .await?;
-    Ok(())
-}
+// NOTE: Prior versions used pk list batches (`ANY($1::uuid[])`). We now prefer range-based
+// batching for fewer round-trips and less allocation.
 
 fn cast_type_for_param(pk_sql_type: &str) -> Result<&'static str> {
     match pk_sql_type.to_uppercase().as_str() {

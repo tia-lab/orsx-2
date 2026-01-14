@@ -37,6 +37,27 @@ For each item below, mark one: **SUPPORTED (offline)** / **SUPPORTED (online)** 
 - Partitioned tables (if any)
 - Materialized views / views (if any)
 
+## 3.1 Strict schema enforcement (opt-in)
+
+Strict mode is opt-in via `MigrationConfig` and affects **planning** (which diffs are ignored) and **strategy selection** (when a rewrite is forced).
+
+Flags:
+
+- `enforce_column_order` (default: false)
+  - When true, physical column order in Postgres must match the Rust spec order.
+  - Any order mismatch becomes rewrite-required (online/offline depending on size).
+- `enforce_exact_columns` (default: false)
+  - When true, the live table must contain exactly the columns in the spec (no extras).
+  - Extra DB columns become rewrite-required.
+- `allow_destructive_drops` (default: false)
+  - When false, strict-exact will **fail** if extras exist (to avoid unintentional column removal).
+  - When true, extras are removed from the **live** table via rewrite, but the backup table retains the original data (zero-loss-by-backup).
+
+Guarantee (strict enabled + allowed):
+- After migration, the **live** table matches the spec:
+  - column set, column order, types, nullability, constraints (as supported).
+  - any “extra” columns are present only in the retained backup table.
+
 ## 4) Strategy selection rules
 
 Define deterministic rules to choose a migration strategy:
@@ -49,6 +70,19 @@ Define deterministic rules to choose a migration strategy:
   - stable primary key or unique key suitable for chunked backfill
   - triggers permitted (or explicit app dual-write contract)
   - ability to run backfill batches without exceeding lock budget
+
+## 4.1 Online rewrite performance levers (opt-in)
+
+These are opt-in knobs; defaults are conservative and deterministic.
+
+- Adaptive batching:
+  - `adaptive_chunk` (default: false)
+  - `online_chunk_size_min`, `online_chunk_size_max`, `online_target_batch_ms`
+  - Current scope: applies to **changelog catch-up** batching (not backfill) to keep backfill performance stable and predictable.
+- Session tuning (must be explicit and documented):
+  - `synchronous_commit_off` (default: false; applies only to backfill/catchup work, never cutover lock validation)
+- Parallel backfill (future / optional):
+  - supported initially for monotonic numeric PKs; UUID parallel range partitioning is deferred
 
 ## 5) Algorithms (must be auditable)
 
@@ -72,6 +106,20 @@ Define:
 - Verification and reconciliation
 - Cutover sequence (minimal lock)
 - Failure recovery and resumability
+
+## 5.3 Online rewrite algorithm (current implementation)
+
+Key properties:
+
+- Shadow table is created with spec schema (order is spec order).
+- Trigger writes a typed PK changelog (no shadow writes in trigger to avoid deadlocks).
+- Backfill uses **range-boundary keyset** batches (`pk > lo AND pk <= hi`) to minimize round trips and allocations.
+- Catch-up applies changelog in **range** batches (same boundary approach).
+- Cutover:
+  - acquire `ACCESS EXCLUSIVE` on the source table
+  - stop changelog writes (drop/disable trigger)
+  - drain changelog to empty within lock budget
+  - swap tables and keep backup table
 
 ## 6) Type conversion contract (mandatory)
 
@@ -107,6 +155,20 @@ List hot paths and how they avoid allocations:
 - SQL generation:
 - Backfill chunking:
 - Verification:
+
+## 9.2 Optimization roadmap (tracked)
+
+High-impact improvements (in priority order):
+
+1. Typed changelog + typed ordering (no `ORDER BY pk::text`)
+2. Range-based catch-up (avoid `ANY($1::uuid[])` lists)
+3. Adaptive chunk sizing (opt-in)
+4. Optional session tuning: `synchronous_commit=off` during backfill/catch-up (opt-in)
+5. Parallel backfill (opt-in; numeric PK first; UUID partitioning deferred)
+
+Each item must include:
+- correctness test(s)
+- perf trial entry in `protocols/orsx2_evidence/migration_trials.md`
 
 ## 10) Test plan mapping
 
