@@ -16,6 +16,7 @@ pub use types::FieldType;
 pub use compressed::{Compressed, CompressedWorkspace};
 
 pub use sqlx;
+pub use jiff::Timestamp;
 
 pub fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -27,5 +28,6 @@ pub mod prelude {
     pub use crate::{quote_identifier, ColumnSpec, Config, Error, FieldType, IndexInfo, IndexType};
     pub use crate::{Migrations, OrsxMigrate, Result, TableSpec};
     pub use crate::{Compressed, CompressedWorkspace};
+    pub use crate::Timestamp;
     pub use sqlx;
 }

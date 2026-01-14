@@ -98,6 +98,7 @@ fn cfg_from_env(mut cfg: MigrationConfig) -> MigrationConfig {
     cfg.online_chunk_size_max = env_u64("ORSX_CHUNK_MAX", cfg.online_chunk_size_max as u64) as i64;
     cfg.online_target_batch_ms = env_u64("ORSX_TARGET_BATCH_MS", cfg.online_target_batch_ms);
     cfg.online_max_batch_ms = env_u64("ORSX_MAX_BATCH_MS", cfg.online_max_batch_ms);
+    cfg.synchronous_commit_off = env_bool("ORSX_SYNC_COMMIT_OFF", cfg.synchronous_commit_off);
     cfg
 }
 

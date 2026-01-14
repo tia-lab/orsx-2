@@ -371,3 +371,96 @@ Outcome:
 
 Notes:
 - A “single-statement catch-up” attempt using `WITH moved ... DELETE ... RETURNING` regressed catch-up time and was reverted; range-based catch-up remains the fast path.
+
+---
+
+## Online rewrite: BIGINT PK parallel backfill A/B (200k rows + inserts, release)
+
+Date (UTC): 2026-01-14T12:40:30Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 200,000 seeded + 50,000 concurrent inserts
+- Columns: `id BIGINT` PK + 49 `INTEGER NOT NULL` + new `INTEGER NOT NULL DEFAULT 0`
+- Write load during migration: inserts only (id range above max)
+
+Command(s):
+- `RUST_LOG=info ORSX_BIG_ROWS=200000 ORSX_BIG_WRITER_ROWS=50000 ORSX_BIG_WRITER_BATCH=5000 ORSX_SYNC_COMMIT_OFF=0 ORSX_PARALLEL_BACKFILL=0 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+- `RUST_LOG=info ORSX_BIG_ROWS=200000 ORSX_BIG_WRITER_ROWS=50000 ORSX_BIG_WRITER_BATCH=5000 ORSX_SYNC_COMMIT_OFF=0 ORSX_PARALLEL_BACKFILL=1 ORSX_PARALLEL_WORKERS=4 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+- `RUST_LOG=info ORSX_BIG_ROWS=200000 ORSX_BIG_WRITER_ROWS=50000 ORSX_BIG_WRITER_BATCH=5000 ORSX_SYNC_COMMIT_OFF=1 ORSX_PARALLEL_BACKFILL=1 ORSX_PARALLEL_WORKERS=4 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+
+Outcome (telemetry from `online_rewrite_table`):
+- Baseline (no parallel, sync_commit_on):
+  - total_ms ~2397, backfill_ms ~1683 (backfill_rows ~270001), catchup_ms ~664 (drained_pk ~40000), cutover_lock_ms ~21
+- Parallel backfill (4 workers, sync_commit_on):
+  - total_ms ~1336, backfill_ms ~825 (backfill_rows ~210000), catchup_ms ~441 (drained_pk ~40000), cutover_lock_ms ~21
+- Parallel backfill + `synchronous_commit_off`:
+  - total_ms ~1281, backfill_ms ~830 (backfill_rows ~210000), catchup_ms ~392 (drained_pk ~40000), cutover_lock_ms ~21
+
+---
+
+## Online rewrite: BIGINT PK parallel backfill scaling (1M rows + inserts, release)
+
+Date (UTC): 2026-01-14T12:46:30Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Table characteristics:
+- Rows: 1,000,000 seeded + 100,000 concurrent inserts
+- Columns: `id BIGINT` PK + 49 `INTEGER NOT NULL` + new `INTEGER NOT NULL DEFAULT 0`
+- Write load during migration: inserts only (id range above max)
+
+Command(s):
+- `RUST_LOG=info ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_WRITER_BATCH=10000 ORSX_SYNC_COMMIT_OFF=0 ORSX_PARALLEL_BACKFILL=0 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+- `RUST_LOG=info ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_WRITER_BATCH=10000 ORSX_SYNC_COMMIT_OFF=0 ORSX_PARALLEL_BACKFILL=1 ORSX_PARALLEL_WORKERS=4 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+- `RUST_LOG=info ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_WRITER_BATCH=10000 ORSX_SYNC_COMMIT_OFF=0 ORSX_PARALLEL_BACKFILL=1 ORSX_PARALLEL_WORKERS=8 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+- `RUST_LOG=info ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_WRITER_BATCH=10000 ORSX_SYNC_COMMIT_OFF=1 ORSX_PARALLEL_BACKFILL=1 ORSX_PARALLEL_WORKERS=4 cargo test -p orsx --release --test migrations_online_big_bigint -- --ignored --nocapture`
+
+Outcome (telemetry from `online_rewrite_table`):
+- Baseline (no parallel, sync_commit_on):
+  - total_ms ~10864, backfill_ms ~7597 (backfill_rows ~1120001), catchup_ms ~2229 (drained_pk ~90000), cutover_lock_ms ~1016
+- Parallel backfill (4 workers, sync_commit_on):
+  - total_ms ~6651, backfill_ms ~5356 (backfill_rows ~1020000), catchup_ms ~1185 (drained_pk ~80000), cutover_lock_ms ~32
+- Parallel backfill (8 workers, sync_commit_on):
+  - total_ms ~4979, backfill_ms ~3633 (backfill_rows ~1010000), catchup_ms ~1284 (drained_pk ~90000), cutover_lock_ms ~30
+- Parallel backfill (4 workers) + `synchronous_commit_off`:
+  - total_ms ~6117, backfill_ms ~4927 (backfill_rows ~1010000), catchup_ms ~1132 (drained_pk ~90000), cutover_lock_ms ~31
+
+Notes:
+- `synchronous_commit_off` results are storage/load dependent; in this run it did not improve vs sync_commit_on.
+
+---
+
+## Online rewrite: UUID worst-case writer A/B (1M rows, release, `synchronous_commit_off`)
+
+Date (UTC): 2026-01-14T12:48:00Z
+Operator: Codex CLI (GPT-5.2)
+
+DB:
+- Postgres version: 16.11 (Debian 16.11-1.pgdg13+1)
+- Storage: local Docker volume (dev)
+
+Workload:
+- Rows: 1,000,000 seeded
+- Writer load: inserts=100,000 updates=500,000 deletes=50,000 (same as previous “worst-case writer”)
+- Config: `adaptive_chunk=true`, chunk_size=20,000
+
+Command(s):
+- `RUST_LOG=info ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_UPDATE_ROWS=500000 ORSX_BIG_UPDATE_BATCH=50000 ORSX_BIG_DELETE_ROWS=50000 ORSX_BIG_DELETE_BATCH=10000 ORSX_ADAPTIVE_CHUNK=1 ORSX_SYNC_COMMIT_OFF=0 cargo test -p orsx --release --test migrations_online_big_uuid -- --ignored --nocapture`
+- `RUST_LOG=info ORSX_BIG_ROWS=1000000 ORSX_BIG_WRITER_ROWS=100000 ORSX_BIG_UPDATE_ROWS=500000 ORSX_BIG_UPDATE_BATCH=50000 ORSX_BIG_DELETE_ROWS=50000 ORSX_BIG_DELETE_BATCH=10000 ORSX_ADAPTIVE_CHUNK=1 ORSX_SYNC_COMMIT_OFF=1 cargo test -p orsx --release --test migrations_online_big_uuid -- --ignored --nocapture`
+
+Outcome (telemetry from `online_rewrite_table`):
+- sync_commit_on:
+  - total_ms ~23014, backfill_ms ~10582 (backfill_rows ~1080000), catchup_ms ~11626 (drained_pk ~590000), cutover_lock_ms ~186
+- `synchronous_commit_off`:
+  - total_ms ~24581, backfill_ms ~8291 (backfill_rows ~1090000), catchup_ms ~15439 (drained_pk ~590000), cutover_lock_ms ~236
+
+Notes:
+- On this setup, `synchronous_commit_off` did not improve end-to-end time; keep it opt-in and validate per deployment.

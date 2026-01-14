@@ -15,6 +15,8 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 cydec = { workspace = true }
 crc32fast = "1.5"
+jiff = { workspace = true }
+jiff-sqlx = { workspace = true }
 
 orsx-macros = { path = "../orsx-macros" }
 

@@ -2,7 +2,6 @@ use crate::migrations::config::MigrationConfig;
 use crate::migrations::introspection::{ColumnInfo, TableSchema};
 use crate::schema::TableSpec;
 use crate::{quote_identifier, Error, Result};
-use futures::future::try_join_all;
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
@@ -11,36 +10,32 @@ struct CutoverStats {
     lock_ms: u64,
 }
 
-async fn with_synchronous_commit<'a, F, Fut, T>(
-    pool: &'a PgPool,
+async fn maybe_set_synchronous_commit_off(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     cfg: &MigrationConfig,
-    f: F,
-) -> Result<T>
-where
-    F: FnOnce(&'a mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    let mut conn = pool.acquire().await?;
+) -> Result<Option<String>> {
     if !cfg.synchronous_commit_off {
-        return f(&mut conn).await;
+        return Ok(None);
     }
-
     let prev: String = sqlx::query_scalar("SHOW synchronous_commit")
-        .fetch_one(&mut *conn)
+        .fetch_one(&mut **conn)
         .await?;
     sqlx::query("SET synchronous_commit TO off")
-        .execute(&mut *conn)
+        .execute(&mut **conn)
         .await?;
+    Ok(Some(prev))
+}
 
-    let out = f(&mut conn).await;
-
-    // Best-effort restore to avoid leaking session settings back into the pool.
-    let _ = sqlx::query("SET synchronous_commit TO $1")
-        .bind(prev)
-        .execute(&mut *conn)
-        .await;
-
-    out
+async fn restore_synchronous_commit(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    prev: Option<String>,
+) {
+    if let Some(prev) = prev {
+        let _ = sqlx::query("SET synchronous_commit TO $1")
+            .bind(prev)
+            .execute(&mut **conn)
+            .await;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,10 +200,12 @@ pub async fn online_rewrite_table(
 
     // Phase 3: backfill in chunks while triggers mirror live writes.
     let backfill_start = Instant::now();
-    let backfill_rows = with_synchronous_commit(pool, cfg, |conn| {
-        backfill(
+    let backfill_rows = {
+        let mut conn = pool.acquire().await?;
+        let prev = maybe_set_synchronous_commit_off(&mut conn, cfg).await?;
+        let out = backfill(
             pool,
-            conn,
+            &mut conn,
             table_name,
             &shadow,
             pk.name,
@@ -216,15 +213,19 @@ pub async fn online_rewrite_table(
             &col_exprs,
             cfg,
         )
-    })
-    .await?;
+        .await;
+        restore_synchronous_commit(&mut conn, prev).await;
+        out?
+    };
     let backfill_ms = backfill_start.elapsed().as_millis() as u64;
 
     // Phase 4: catch up changes by reading changelog and applying to the shadow table.
     let catchup_start = Instant::now();
-    let catchup_drained = with_synchronous_commit(pool, cfg, |conn| {
-        catch_up_best_effort(
-            conn,
+    let catchup_drained = {
+        let mut conn = pool.acquire().await?;
+        let prev = maybe_set_synchronous_commit_off(&mut conn, cfg).await?;
+        let out = catch_up_best_effort(
+            &mut conn,
             table_name,
             &shadow,
             &changelog,
@@ -233,8 +234,10 @@ pub async fn online_rewrite_table(
             &col_exprs,
             cfg,
         )
-    })
-    .await?;
+        .await;
+        restore_synchronous_commit(&mut conn, prev).await;
+        out?
+    };
     let catchup_ms = catchup_start.elapsed().as_millis() as u64;
 
     // Phase 5: cutover (short lock): disable trigger, final drain, swap, cleanup.
@@ -426,6 +429,18 @@ async fn backfill(
         .await;
     }
 
+    backfill_sequential(conn, source, shadow, &pk_q, pk_cast, col_exprs, cfg).await
+}
+
+async fn backfill_sequential(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    source: &str,
+    shadow: &str,
+    pk_q: &str,
+    pk_cast: &str,
+    col_exprs: &[(&'static str, String)],
+    cfg: &MigrationConfig,
+) -> Result<u64> {
     let mut total_rows: u64 = 0;
     let mut last_pk: Option<String> = None;
 
@@ -989,7 +1004,16 @@ async fn parallel_backfill_bigint(
         let mut conn = pool.acquire().await?;
         let mut cfg2 = cfg.clone();
         cfg2.parallel_backfill = false;
-        return backfill(pool, &mut conn, source, shadow, pk, pk_sql_type, col_exprs, &cfg2).await;
+        return backfill_sequential(
+            &mut conn,
+            source,
+            shadow,
+            &pk_q,
+            "bigint",
+            col_exprs,
+            &cfg2,
+        )
+        .await;
     }
 
     let span = (max_pk - min_pk).saturating_add(1);
@@ -1018,7 +1042,7 @@ async fn parallel_backfill_bigint(
 
     let chunk_size = cfg.online_chunk_size.max(1);
 
-    let mut tasks = Vec::with_capacity(workers);
+    let mut join_set: tokio::task::JoinSet<Result<u64>> = tokio::task::JoinSet::new();
     for i in 0..workers {
         let lo = min_pk.saturating_add(step.saturating_mul(i as i64));
         let mut hi = lo.saturating_add(step).saturating_sub(1);
@@ -1037,7 +1061,7 @@ async fn parallel_backfill_bigint(
         let cfg = cfg.clone();
         let pool = pool.clone();
 
-        tasks.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             let initial_sql = format!(
                 r#"
                 WITH moved AS MATERIALIZED (
@@ -1091,21 +1115,24 @@ async fn parallel_backfill_bigint(
             let mut moved_total: u64 = 0;
             let mut last: Option<i64> = None;
 
-            let res: Result<u64> = with_synchronous_commit(&pool, &cfg, |conn| async move {
+            let mut conn = pool.acquire().await?;
+            let prev = maybe_set_synchronous_commit_off(&mut conn, &cfg).await?;
+
+            let res: Result<u64> = async {
                 loop {
                     let (next_last, moved_rows): (Option<i64>, i64) = if let Some(lp) = last {
                         sqlx::query_as(&next_sql)
                             .bind(lp)
                             .bind(hi)
                             .bind(chunk_size)
-                            .fetch_one(&mut **conn)
+                            .fetch_one(&mut *conn)
                             .await?
                     } else {
                         sqlx::query_as(&initial_sql)
                             .bind(lo)
                             .bind(hi)
                             .bind(chunk_size)
-                            .fetch_one(&mut **conn)
+                            .fetch_one(&mut *conn)
                             .await?
                     };
 
@@ -1121,21 +1148,21 @@ async fn parallel_backfill_bigint(
                     }
                 }
                 Ok(moved_total)
-            })
+            }
             .await;
 
+            restore_synchronous_commit(&mut conn, prev).await;
             res
-        }));
+        });
     }
 
-    let joined = try_join_all(tasks)
-        .await
-        .map_err(|e| Error::Other(format!("parallel backfill join error: {e}")))?;
-
-    joined.into_iter().try_fold(0u64, |acc, r| {
+    let mut total: u64 = 0;
+    while let Some(res) = join_set.join_next().await {
+        let r = res.map_err(|e| Error::Other(format!("parallel backfill join error: {e}")))?;
         let v = r?;
-        Ok(acc.saturating_add(v))
-    })
+        total = total.saturating_add(v);
+    }
+    Ok(total)
 }
 
 fn on_conflict_clause(pk_q: &str, set_parts: &str) -> String {

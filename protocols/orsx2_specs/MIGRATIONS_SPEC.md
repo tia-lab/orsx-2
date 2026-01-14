@@ -81,8 +81,12 @@ These are opt-in knobs; defaults are conservative and deterministic.
   - Current scope: applies to **changelog catch-up** batching (not backfill) to keep backfill performance stable and predictable.
 - Session tuning (must be explicit and documented):
   - `synchronous_commit_off` (default: false; applies only to backfill/catchup work, never cutover lock validation)
+  - Contract: backfill/catch-up commits may acknowledge before WAL flush; cutover still enforces correctness and lock-budget constraints.
+  - Note: this is storage/load dependent and may not improve throughput; must be validated per deployment.
 - Parallel backfill (future / optional):
-  - supported initially for monotonic numeric PKs; UUID parallel range partitioning is deferred
+  - `parallel_backfill` (default: false) + `parallel_backfill_workers`
+  - Supported initially for `BIGINT` primary keys (range partitioning); UUID parallel range partitioning is deferred.
+  - Requirement: pool max connections should be sized to at least `parallel_backfill_workers + 2` to avoid queueing.
 
 ## 5) Algorithms (must be auditable)
 

@@ -58,6 +58,8 @@ Append results to `protocols/orsx2_evidence/migration_trials.md`:
 - Optimization A/B runs:
   - rerun the same workload after each high-impact optimization to quantify deltas
   - include A/B for `adaptive_chunk` on writer-heavy workloads (expect catch-up improvements; no change on backfill-only workloads)
+  - include A/B for `parallel_backfill` on BIGINT PK workloads (expect backfill improvements)
+  - include A/B for `synchronous_commit_off` (expect storage-dependent improvements)
 
 ## 2.1 Allocation discipline checks (mandatory)
 
