@@ -20,6 +20,13 @@ Owner: (Validator)
 - Online path (if supported)
 - Compression `BYTEA` read/write
 
+### 1.3.3 Columnar retrieval correctness (DB)
+
+- Fast path (`COPY ... TO STDOUT (FORMAT BINARY)`) returns the same values as row-wise `SELECT`.
+- Mixed fixed-width + varlen + NULLs.
+- Boundary cases: empty result, 1 row, N rows, N+1 rows (batching).
+- Ordering: column order == query select-list order; row order == query order.
+
 ### 1.3.1 Strict enforcement correctness (DB)
 
 - `enforce_column_order=true` forces rewrite when order mismatched; post-migration physical order equals spec.
@@ -46,6 +53,17 @@ Owner: (Validator)
 - Planning time vs schema size.
 - DB-facing throughput (if feasible): bulk insert/read; online backfill.
 
+### 2.3 Columnar perf trials (DB, release)
+
+Append results to `protocols/orsx2_evidence/columnar_trials.md`:
+
+- 100k rows, 50 columns (mixed types)
+- 100k rows, 500 columns (mixed types)
+- 1M rows, 50 columns (mixed types, streaming/batching)
+- Compare:
+  - COPY BINARY path vs row-wise decode
+  - workspace reuse vs fresh allocations
+
 ## 2.2 Migration perf trials (DB, release)
 
 Append results to `protocols/orsx2_evidence/migration_trials.md`:
@@ -70,6 +88,7 @@ Append results to `protocols/orsx2_evidence/migration_trials.md`:
 
 - `protocols/orsx2_evidence/bench_results.md`
 - `protocols/orsx2_evidence/migration_trials.md`
+- `protocols/orsx2_evidence/columnar_trials.md`
 
 Each entry must include:
 

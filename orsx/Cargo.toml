@@ -8,6 +8,8 @@ description = "orsx2 rewrite in progress: Postgres migrations + compression over
 [dependencies]
 sqlx = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

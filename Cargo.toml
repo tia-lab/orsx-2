@@ -5,6 +5,8 @@ resolver = "2"
 [workspace.dependencies]
 # Core database
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid"] }
+bytes = "1"
+futures-util = "0.3"
 
 # DateTime handling
 jiff = { version = "0.2", features = ["serde"] }

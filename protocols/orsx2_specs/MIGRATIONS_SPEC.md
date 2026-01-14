@@ -8,7 +8,9 @@ Applies to: `orsx2` crate
 
 - Component: `orsx2::migrations`
 - Purpose: schema-driven, zero-loss migrations for PostgreSQL at large-table scale.
-- Non-scope: ORM, query builder, cross-database support.
+- Non-scope:
+  - ORM, query builder, cross-database support.
+  - Columnar retrieval / transport (specified separately in `protocols/orsx2_specs/COLUMNAR_RETRIEVAL_SPEC.md`).
 
 ## 2) Inputs and bounds (mandatory)
 

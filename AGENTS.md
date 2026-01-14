@@ -12,15 +12,18 @@ These guidelines exist to keep changes **safe**, **auditable**, and **non-surpri
 Rewrite work for `orsx2` must follow these documents:
 
 - `protocols/orsx2_rewrite_protocol.md:1` (end-to-end process, gates, evidence logs)
+- `protocols/orsx2_columnar_protocol.md:1` (columnar retrieval process, gates, evidence logs)
 - Spec templates to fill before implementation:
   - `protocols/orsx2_specs/MIGRATIONS_SPEC.md:1`
   - `protocols/orsx2_specs/SCHEMA_INTROSPECTION_SPEC.md:1`
   - `protocols/orsx2_specs/COMPRESSION_SPEC.md:1`
   - `protocols/orsx2_specs/MACROS_SPEC.md:1`
   - `protocols/orsx2_specs/TESTING_AND_BENCH_PLAN.md:1`
+  - `protocols/orsx2_specs/COLUMNAR_RETRIEVAL_SPEC.md:1`
 - Append-only evidence logs (required for perf/safety claims):
   - `protocols/orsx2_evidence/bench_results.md:1`
   - `protocols/orsx2_evidence/migration_trials.md:1`
+  - `protocols/orsx2_evidence/columnar_trials.md:1`
 
 Legacy protocol/examples used as style reference (do not copy their legal headers into this repo):
 

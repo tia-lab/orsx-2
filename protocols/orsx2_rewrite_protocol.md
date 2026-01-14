@@ -88,6 +88,7 @@ Create the following spec documents before implementation:
 3. `protocols/orsx2_specs/COMPRESSION_SPEC.md`
 4. `protocols/orsx2_specs/MACROS_SPEC.md` (or an explicit “no macros” decision + alternative schema description)
 5. `protocols/orsx2_specs/TESTING_AND_BENCH_PLAN.md`
+6. `protocols/orsx2_specs/COLUMNAR_RETRIEVAL_SPEC.md` (required only if `orsx2::columnar` is in scope)
 
 Each spec must include:
 

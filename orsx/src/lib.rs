@@ -6,6 +6,7 @@ pub mod schema;
 pub mod types;
 pub mod compression;
 pub mod compressed;
+pub mod columnar;
 
 pub use error::{Error, Result};
 pub use config::Config;
@@ -14,6 +15,7 @@ pub use migrations::Migrations;
 pub use schema::{ColumnSpec, OrsxMigrate, TableSpec};
 pub use types::FieldType;
 pub use compressed::{Compressed, CompressedWorkspace};
+pub use columnar::{ColumnarBatch, ColumnarSchema, ColumnarType, CopyBinaryBatchReader};
 
 pub use sqlx;
 pub use jiff::Timestamp;
@@ -28,6 +30,7 @@ pub mod prelude {
     pub use crate::{quote_identifier, ColumnSpec, Config, Error, FieldType, IndexInfo, IndexType};
     pub use crate::{Migrations, OrsxMigrate, Result, TableSpec};
     pub use crate::{Compressed, CompressedWorkspace};
+    pub use crate::{ColumnarBatch, ColumnarSchema, ColumnarType, CopyBinaryBatchReader};
     pub use crate::Timestamp;
     pub use sqlx;
 }
