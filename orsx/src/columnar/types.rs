@@ -1,7 +1,8 @@
 use crate::{Error, Result};
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use futures_util::TryStreamExt;
-use sqlx::postgres::{PgConnection, PgCopyOut};
+use sqlx::postgres::PgConnection;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ColumnarType {
@@ -91,11 +92,11 @@ impl ValidityBitmap {
         Ok(())
     }
 
-    fn set(&mut self, row_idx: usize, is_valid: bool) {
+    fn set(&mut self, row_idx: usize, is_valid: bool) -> Result<()> {
         let byte_idx = row_idx / 8;
         let bit_idx = row_idx % 8;
         if byte_idx >= self.bytes.len() {
-            return;
+            return Err(Error::Other("validity bitmap out of bounds".to_string()));
         }
         let mask = 1u8 << bit_idx;
         if is_valid {
@@ -103,6 +104,7 @@ impl ValidityBitmap {
         } else {
             self.bytes[byte_idx] &= !mask;
         }
+        Ok(())
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -210,7 +212,7 @@ impl ColumnData {
         Ok(())
     }
 
-    fn set_validity(&mut self, row_idx: usize, is_valid: bool) {
+    fn set_validity(&mut self, row_idx: usize, is_valid: bool) -> Result<()> {
         match self {
             ColumnData::Fixed { validity, .. } => validity.set(row_idx, is_valid),
             ColumnData::Var { validity, .. } => validity.set(row_idx, is_valid),
@@ -329,7 +331,7 @@ impl ColumnarBatch {
 }
 
 pub struct CopyBinaryBatchReader<'c> {
-    copy_out: PgCopyOut<'c>,
+    copy_out: BoxStream<'c, std::result::Result<Bytes, sqlx::Error>>,
     schema: ColumnarSchema,
     buf: Vec<u8>,
     pos: usize,
@@ -430,10 +432,11 @@ impl<'c> CopyBinaryBatchReader<'c> {
 
     async fn parse_header(&mut self) -> Result<()> {
         const SIG: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
-        let sig = self.read_bytes(11).await?;
+        let sig = self.read_slice(11).await?;
         if sig != SIG {
             return Err(Error::Other("invalid COPY BINARY signature".to_string()));
         }
+        self.maybe_compact();
         let flags = self.read_i32_be().await?;
         if flags != 0 {
             return Err(Error::Other(format!(
@@ -451,7 +454,8 @@ impl<'c> CopyBinaryBatchReader<'c> {
             return Err(Error::Other("COPY header extension too large".to_string()));
         }
         if ext_len_usize > 0 {
-            let _ = self.read_bytes(ext_len_usize).await?;
+            let _ = self.read_slice(ext_len_usize).await?;
+            self.maybe_compact();
         }
         Ok(())
     }
@@ -474,7 +478,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
             .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
 
         if is_null {
-            col.set_validity(row_idx, false);
+            col.set_validity(row_idx, false)?;
             match col {
                 ColumnData::Fixed { width, values, .. } => {
                     let start = values.len();
@@ -495,7 +499,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
             return Err(Error::Other("COPY field too large".to_string()));
         }
 
-        col.set_validity(row_idx, true);
+        col.set_validity(row_idx, true)?;
         match col {
             ColumnData::Fixed {
                 ty,
@@ -508,7 +512,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         "COPY field length mismatch for {ty:?}: got {len_usize}, expected {width}"
                     )));
                 }
-                let bytes = self.read_bytes(len_usize).await?;
+                let bytes = self.read_slice(len_usize).await?;
                 let start = values.len();
                 let new_len = start
                     .checked_add(*width)
@@ -568,14 +572,14 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         return Err(Error::Other("internal type mismatch".to_string()));
                     }
                 }
+                self.maybe_compact();
             }
             ColumnData::Var { ty, data, .. } => {
-                let bytes = self.read_bytes(len_usize).await?;
+                let validate_utf8 = self.read_cfg.validate_utf8;
+                let bytes = self.read_slice(len_usize).await?;
                 match ty {
                     ColumnarType::Utf8 => {
-                        if self.read_cfg.validate_utf8
-                            && std::str::from_utf8(bytes).is_err()
-                        {
+                        if validate_utf8 && std::str::from_utf8(bytes).is_err() {
                             return Err(Error::Other("invalid UTF-8 in TEXT column".to_string()));
                         }
                         data.extend_from_slice(bytes);
@@ -585,6 +589,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
                     }
                     _ => return Err(Error::Other("internal type mismatch".to_string())),
                 }
+                self.maybe_compact();
             }
         }
 
@@ -620,7 +625,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
         self.pos = 0;
     }
 
-    async fn read_bytes(&mut self, n: usize) -> Result<&[u8]> {
+    async fn read_slice(&mut self, n: usize) -> Result<&[u8]> {
         self.ensure_available(n).await?;
         let start = self.pos;
         let end = start
@@ -628,17 +633,20 @@ impl<'c> CopyBinaryBatchReader<'c> {
             .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
         let slice = &self.buf[start..end];
         self.pos = end;
-        self.maybe_compact();
         Ok(slice)
     }
 
     async fn read_i16_be(&mut self) -> Result<i16> {
-        let b = self.read_bytes(2).await?;
-        Ok(i16::from_be_bytes([b[0], b[1]]))
+        let b = self.read_slice(2).await?;
+        let arr = [b[0], b[1]];
+        self.maybe_compact();
+        Ok(i16::from_be_bytes(arr))
     }
 
     async fn read_i32_be(&mut self) -> Result<i32> {
-        let b = self.read_bytes(4).await?;
-        Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        let b = self.read_slice(4).await?;
+        let arr = [b[0], b[1], b[2], b[3]];
+        self.maybe_compact();
+        Ok(i32::from_be_bytes(arr))
     }
 }
