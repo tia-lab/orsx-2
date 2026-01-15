@@ -240,5 +240,11 @@ Potential follow-ups (only if evidence shows benefit):
 
 1. Dictionary encoding for `Utf8`/`Bytes` (opt-in).
 2. Optional compression of per-column payloads for transport (opt-in).
+
+## Appendix — Add-ons v1.2
+
+Optional columnar expansions (additional Postgres types, row-wise strict preflight) are grouped in:
+
+- `protocols/orsx2_specs/ADDONS_V1_2_SPEC.md:1`
 3. Parallel decode of fixed-width columns (opt-in; determinism policy required).
 4. Arrow IPC export (compat layer) as a separate, optional module/feature.

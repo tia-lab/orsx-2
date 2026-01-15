@@ -197,3 +197,9 @@ For each supported change, list:
 Indexes (including composite unique semantics) are specified separately in:
 
 - `protocols/orsx2_specs/INDEXES_AND_UNIQUENESS_SPEC.md:1`
+
+## Appendix — Add-ons v1.2
+
+Optional migration-related expansions (migration key for composite/no-PK tables, multi-schema, advanced index features) are grouped in:
+
+- `protocols/orsx2_specs/ADDONS_V1_2_SPEC.md:1`
