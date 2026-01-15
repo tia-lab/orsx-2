@@ -17,6 +17,13 @@ pub struct TableSchema {
     pub columns: Vec<ColumnInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexIdentity {
+    pub method: String,
+    pub unique: bool,
+    pub columns: Vec<String>,
+}
+
 pub async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool> {
     let exists: bool = sqlx::query_scalar(
         r#"
@@ -35,6 +42,45 @@ pub async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool> {
     .await?;
 
     Ok(exists)
+}
+
+pub async fn read_table_index_identities(pool: &PgPool, table_name: &str) -> Result<Vec<IndexIdentity>> {
+    // Scope: public schema only (v1).
+    //
+    // We consider only "ready + valid" indexes to avoid treating in-progress concurrent builds
+    // as satisfying the schema.
+    let rows = sqlx::query_as::<_, (bool, String, Vec<String>)>(
+        r#"
+        SELECT
+          i.indisunique AS is_unique,
+          am.amname AS method,
+          array_agg(a.attname ORDER BY k.ord) AS columns
+        FROM pg_catalog.pg_index i
+        JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+        JOIN pg_catalog.pg_am am ON am.oid = ic.relam
+        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+        WHERE n.nspname = 'public'
+          AND t.relname = $1
+          AND i.indisvalid
+          AND i.indisready
+        GROUP BY i.indexrelid, i.indisunique, am.amname
+        "#,
+    )
+    .bind(table_name)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(unique, method, columns)| IndexIdentity {
+            unique,
+            method,
+            columns,
+        })
+        .collect())
 }
 
 pub async fn read_table_schema(pool: &PgPool, table_name: &str) -> Result<TableSchema> {

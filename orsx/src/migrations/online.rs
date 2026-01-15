@@ -257,11 +257,7 @@ pub async fn online_rewrite_table(
     .await?;
 
     // Ensure declared indexes exist on the new live table. Use CONCURRENTLY to keep writes flowing.
-    for idx in spec.indexes {
-        let sql = create_index_sql_concurrently(table_name, idx);
-        let mut conn = pool.acquire().await?;
-        sqlx::query(&sql).execute(&mut *conn).await?;
-    }
+    super::planning::ensure_indexes_concurrently(pool, table_name, spec).await?;
 
     let total_ms = total_start.elapsed().as_millis() as u64;
     tracing::info!(
@@ -1196,18 +1192,4 @@ fn derived_object_name(base: &str, kind: &str, ts: u64) -> String {
     format!("{truncated}{suffix}")
 }
 
-fn create_index_sql_concurrently(table_name: &str, index: &crate::IndexInfo) -> String {
-    let unique = if index.unique { "UNIQUE " } else { "" };
-    let cols = index
-        .columns
-        .iter()
-        .map(|c| quote_identifier(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE {unique}INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING {} ({cols})",
-        quote_identifier(index.name),
-        quote_identifier(table_name),
-        index.index_type.to_sql()
-    )
-}
+// Index creation logic is centralized in `planning::ensure_indexes_concurrently`.

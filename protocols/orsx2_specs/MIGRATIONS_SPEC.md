@@ -191,3 +191,9 @@ For each supported change, list:
 - Paths searched:
 - Candidates:
   - path → what it provides → reuse/extend/reject → justification
+
+## Appendix — Indexes and uniqueness
+
+Indexes (including composite unique semantics) are specified separately in:
+
+- `protocols/orsx2_specs/INDEXES_AND_UNIQUENESS_SPEC.md:1`

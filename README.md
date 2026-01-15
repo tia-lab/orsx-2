@@ -109,6 +109,87 @@ let cfg = MigrationConfig {
 Migrations::init_with_config(&pool, &[(dummy, None)], &cfg).await?;
 ```
 
+### Indexes and uniqueness
+
+There are three related mechanisms:
+
+- Primary key: `#[orsx_column(primary_key)]` (single-column primary key is required for online rewrite).
+- Single-column unique: `#[orsx_column(unique)]`
+- Indexes:
+  - single-column: `#[orsx_column(index ...)]`
+  - multi-column: table-level `index(...)` declarations inside `#[orsx_table(...)]`
+
+#### Single-column indexes (field attribute)
+
+```rust
+#[derive(orsx::OrsxMigrate)]
+#[orsx_table("users")]
+struct User {
+    #[orsx_column(primary_key)]
+    id: String,
+
+    #[orsx_column(index)] // btree index on email
+    email: String,
+
+    #[orsx_column(index(type = "gin"))] // gin index
+    payload: String,
+}
+```
+
+#### Single-column unique (field attribute)
+
+```rust
+#[derive(orsx::OrsxMigrate)]
+#[orsx_table("users")]
+struct User {
+    #[orsx_column(primary_key)]
+    id: String,
+
+    #[orsx_column(unique)]
+    email: String,
+}
+```
+
+On existing tables, ORSX enforces “unique” by creating a unique index concurrently (idempotent).
+
+#### Composite (multi-column) unique / indexes (table-level)
+
+Table-level `index(...)` declarations live inside `#[orsx_table(...)]`:
+
+```rust
+#[derive(orsx::OrsxMigrate)]
+#[orsx_table(
+  "users",
+  index(columns("tenant_id", "email"), unique),
+  index(columns("tenant_id", "created_at"))
+)]
+struct User {
+    #[orsx_column(primary_key)]
+    id: String,
+    tenant_id: String,
+    email: String,
+    created_at: orsx::Timestamp,
+}
+```
+
+Notes:
+
+- `type="btree"|"gin"|"gist"|"hash"` is supported (default is `btree`).
+- `name="..."` is optional; if omitted, ORSX derives a deterministic, table-specific index name at runtime.
+
+#### Idempotency rules (important)
+
+When applying indexes on existing tables:
+
+- SQL uses `IF NOT EXISTS`, and
+- ORSX also checks for an equivalent existing index by semantics (method + uniqueness + ordered column list).
+
+This prevents creating duplicates if the database already has the same index under a different name.
+
+Reference tests:
+
+- `orsx/tests/migrations_indexes_idempotency.rs`
+
 ## 2) Columnar retrieval (COPY BINARY + row-wise)
 
 ### What it does
@@ -351,6 +432,7 @@ Useful commands:
 - DB correctness tests (require Postgres):
   - `cargo test -p orsx --test columnar_copy_binary --release`
   - `cargo test -p orsx --test migrations_strict_correctness`
+  - `cargo test -p orsx --test migrations_indexes_idempotency`
 - Perf / large-table tests (ignored by default; require Postgres and time):
   - `cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
   - `cargo test -p orsx --test migrations_online_big_uuid --release -- --ignored --nocapture`

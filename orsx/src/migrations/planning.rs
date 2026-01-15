@@ -2,6 +2,7 @@ use crate::{quote_identifier, indexes::IndexInfo, schema::TableSpec};
 
 use super::introspection::{ColumnInfo, TableSchema};
 use super::config::MigrationConfig;
+use super::introspection::IndexIdentity;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaDiff {
@@ -125,9 +126,10 @@ pub fn create_index_sql(table_name: &str, index: &IndexInfo) -> String {
         .map(|c| quote_identifier(c))
         .collect::<Vec<_>>()
         .join(", ");
+    let idx_name = derive_index_name(table_name, index);
     format!(
         "CREATE {unique}INDEX IF NOT EXISTS {} ON {} USING {} ({cols})",
-        quote_identifier(index.name),
+        quote_identifier(&idx_name),
         quote_identifier(table_name),
         index.index_type.to_sql()
     )
@@ -136,7 +138,7 @@ pub fn create_index_sql(table_name: &str, index: &IndexInfo) -> String {
 pub async fn apply_safe_alters(
     pool: &sqlx::PgPool,
     table_name: &str,
-    spec: &TableSpec,
+    _spec: &TableSpec,
     cfg: &MigrationConfig,
     current: &TableSchema,
     expected: &TableSchema,
@@ -202,8 +204,19 @@ pub async fn apply_safe_alters(
                         continue;
                     }
 
-                    // Deterministic names. Create unique index to satisfy uniqueness semantics.
-                    let idx_name = format!("orsx_uq_{table_name}_{column}");
+                    // Ensure uniqueness semantics via a unique index. This is idempotent by
+                    // semantics: if an equivalent unique index already exists (any name), skip.
+                    let existing_indexes =
+                        super::introspection::read_table_index_identities(pool, table_name).await?;
+                    if existing_indexes.iter().any(|e| {
+                        e.unique
+                            && e.method == "btree"
+                            && e.columns.len() == 1
+                            && e.columns[0] == *column
+                    }) {
+                        continue;
+                    }
+                    let idx_name = derive_unique_column_index_name(table_name, column.as_str());
                     let create_idx = format!(
                         "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} ({})",
                         quote_identifier(&idx_name),
@@ -225,14 +238,29 @@ pub async fn apply_safe_alters(
         }
     }
 
+    let _ = current;
+    Ok(())
+}
+
+pub async fn ensure_indexes_concurrently(
+    pool: &sqlx::PgPool,
+    table_name: &str,
+    spec: &TableSpec,
+) -> crate::Result<()> {
     // Ensure declared indexes exist. Use CONCURRENTLY to avoid long write blocks on large tables.
-    for idx in spec.indexes {
+    let existing_indexes = super::introspection::read_table_index_identities(pool, table_name).await?;
+
+    let mut idxs_sorted: Vec<&IndexInfo> = spec.indexes.iter().collect();
+    idxs_sorted.sort_by(|a, b| index_sort_key(a).cmp(&index_sort_key(b)));
+
+    for idx in idxs_sorted {
+        if has_equivalent_index(&existing_indexes, idx) {
+            continue;
+        }
         let sql = create_index_sql_concurrently(table_name, idx);
         let mut conn = pool.acquire().await?;
         sqlx::query(&sql).execute(&mut *conn).await?;
     }
-
-    let _ = current;
     Ok(())
 }
 
@@ -318,10 +346,81 @@ fn create_index_sql_concurrently(table_name: &str, index: &IndexInfo) -> String 
         .map(|c| quote_identifier(c))
         .collect::<Vec<_>>()
         .join(", ");
+    let idx_name = derive_index_name(table_name, index);
     format!(
         "CREATE {unique}INDEX CONCURRENTLY IF NOT EXISTS {} ON {} USING {} ({cols})",
-        quote_identifier(index.name),
+        quote_identifier(&idx_name),
         quote_identifier(table_name),
         index.index_type.to_sql()
     )
+}
+
+pub(crate) fn derive_index_name(table_name: &str, index: &IndexInfo) -> String {
+    // Names must be unique within the schema. When the same struct spec is applied to multiple
+    // table names, index names must incorporate the table name (otherwise they collide).
+    let method = index.index_type.to_sql().to_lowercase();
+    let cols = index.columns.join("_");
+    let unique = if index.unique { "uq" } else { "ix" };
+
+    let mut base = if index.name.is_empty() {
+        format!("orsx_{unique}_{table_name}_{method}_{cols}")
+    } else if index.name.contains(table_name) {
+        // Assume the user already provided a table-specific name.
+        index.name.to_string()
+    } else {
+        // Treat the provided name as a label but still make it table-specific.
+        format!("{}_{}", index.name, table_name)
+    };
+
+    // Postgres identifier limit: 63 bytes.
+    if base.len() <= 63 {
+        return base;
+    }
+
+    // Stable hash suffix based on canonical identity.
+    let canon = format!(
+        "table={table_name}|method={method}|unique={}|cols={}",
+        index.unique,
+        index.columns.join(",")
+    );
+    let hash = crc32fast::hash(canon.as_bytes());
+    let suffix = format!("_{hash:08x}");
+    let max_prefix = 63usize.saturating_sub(suffix.len());
+    base.truncate(max_prefix);
+    base.push_str(&suffix);
+    base
+}
+
+fn index_sort_key(idx: &IndexInfo) -> (u8, &'static str, String) {
+    let u = if idx.unique { 0 } else { 1 };
+    let m = idx.index_type.to_sql();
+    let cols = idx.columns.join(",");
+    (u, m, cols)
+}
+
+fn has_equivalent_index(existing: &[IndexIdentity], idx: &IndexInfo) -> bool {
+    let want_method = idx.index_type.to_sql().to_lowercase();
+    existing.iter().any(|e| {
+        e.unique == idx.unique
+            && e.method == want_method
+            && e.columns.len() == idx.columns.len()
+            && e.columns
+                .iter()
+                .zip(idx.columns.iter())
+                .all(|(a, b)| a == b)
+    })
+}
+
+fn derive_unique_column_index_name(table_name: &str, column: &str) -> String {
+    let mut base = format!("orsx_uq_{table_name}_{column}");
+    if base.len() <= 63 {
+        return base;
+    }
+    let canon = format!("table={table_name}|method=btree|unique=true|cols={column}");
+    let hash = crc32fast::hash(canon.as_bytes());
+    let suffix = format!("_{hash:08x}");
+    let max_prefix = 63usize.saturating_sub(suffix.len());
+    base.truncate(max_prefix);
+    base.push_str(&suffix);
+    base
 }

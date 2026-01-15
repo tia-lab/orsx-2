@@ -100,6 +100,10 @@ impl Migrations {
                 }
             }
 
+            // Ensure indexes exist even when there were no schema diffs. This must be done after
+            // any rewrite, but also for externally-created tables that match column schema.
+            planning::ensure_indexes_concurrently(pool, table_name, &spec).await?;
+
             tracing::info!(
                 table = table_name,
                 elapsed_ms = start.elapsed().as_millis() as u64,

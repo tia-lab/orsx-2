@@ -27,6 +27,13 @@ Owner: (Validator)
 - Boundary cases: empty result, 1 row, N rows, N+1 rows (batching).
 - Ordering: column order == query select-list order; row order == query order.
 
+### 1.3.4 Indexes and uniqueness idempotency (DB)
+
+- Adding `unique` to a column creates uniqueness semantics and is idempotent (re-running does not create duplicates).
+- Composite unique (multi-column) behaves the same once implemented.
+- Existing equivalent indexes with different names do not cause duplicate index creation.
+- Table-name overrides (`(T, Some("other_table"))`) do not collide on index names and remain idempotent per table.
+
 ### 1.3.1 Strict enforcement correctness (DB)
 
 - `enforce_column_order=true` forces rewrite when order mismatched; post-migration physical order equals spec.
