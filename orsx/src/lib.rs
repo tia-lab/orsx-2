@@ -18,6 +18,7 @@ pub use compressed::{Compressed, CompressedWorkspace};
 pub use columnar::{
     ColumnarAutoConfig, ColumnarBatch, ColumnarBatchReader, ColumnarField, ColumnarReaderMode,
     ColumnarSchema, ColumnarType, CopyBinaryBatchReader, RowWiseBatchReader,
+    RowWiseBatchReaderConfig,
 };
 
 pub use sqlx;
@@ -39,6 +40,7 @@ pub mod prelude {
     pub use crate::{
         ColumnarAutoConfig, ColumnarBatch, ColumnarBatchReader, ColumnarField, ColumnarReaderMode,
         ColumnarSchema, ColumnarType, CopyBinaryBatchReader, RowWiseBatchReader,
+        RowWiseBatchReaderConfig,
     };
     pub use crate::Timestamp;
     pub use crate::SqlxTimestamp;

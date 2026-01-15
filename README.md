@@ -1,14 +1,14 @@
-# orsx (orsx2 rewrite, in progress)
+# orsx (orsx2 rewrite)
 
 This workspace contains a Rust library (`orsx`) and a proc-macro crate (`orsx-macros`).
 
-The current implementation focuses on three pieces:
+The current implementation covers:
 
-1. **Schema-driven Postgres migrations** (including an online rewrite path for large tables).
-2. **Columnar retrieval** into typed column buffers (COPY BINARY fast path + row-wise fallback).
-3. **Numeric vector compression** stored as `BYTEA` with a small self-describing envelope.
+1. Schema-driven Postgres migrations (including an online rewrite path for large tables).
+2. Columnar retrieval into `ColumnarBatch` (COPY BINARY and row-wise).
+3. Numeric vector compression stored as `BYTEA` with a small envelope.
 
-This README is written to match the repo state as of this checkout. It is not a promise of stability.
+This README is intended to describe the repository as it exists right now, including current limitations.
 
 ## Non-goals
 
@@ -44,16 +44,18 @@ You define a table schema in Rust via `#[derive(OrsxMigrate)]`. At runtime, `ors
   - installs a trigger that records changed primary keys into a changelog table,
   - backfills data from the original table into the shadow table in chunks,
   - applies changelog catch-up rounds,
-  - takes a short `ACCESS EXCLUSIVE` lock to drain remaining changes and swap tables,
-  - keeps a **backup table** with the original data.
+- takes a short `ACCESS EXCLUSIVE` lock to drain remaining changes and swap tables,
+- keeps a **backup table** with the original data.
 
-“Zero-loss” here means: when a rewrite happens, the old table is preserved as a backup table (not dropped).
+“Zero-loss-by-backup” here means: when a rewrite happens, the old table is preserved as a backup table (not dropped).
 
 ### Current limitations (important)
 
 The current online rewrite implementation has constraints that are enforced in code:
 
-- Online rewrite requires **exactly one primary key column**.
+- Online rewrite requires either:
+  - exactly one primary key column, or
+  - `MigrationConfig.enable_migration_key = true` (adds and uses `__orsx_mig_id BIGINT` as the rewrite key).
 - Introspection assumes the table is in the `public` schema.
 - Constraint handling is limited (single-column PK/unique are tracked; other constraints are not fully modeled).
 - Some diffs intentionally trigger rewrite (type changes, column position changes, drop column, etc.).
@@ -103,6 +105,26 @@ let cfg = MigrationConfig {
     enforce_column_order: true,
     enforce_exact_columns: true,
     allow_destructive_drops: true,
+    ..MigrationConfig::default()
+};
+
+Migrations::init_with_config(&pool, &[(dummy, None)], &cfg).await?;
+```
+
+### Online rewrite key: enable migration key (add-on v1.2)
+
+If you want online rewrite for a table spec that does not have exactly one PK column, enable:
+
+- `MigrationConfig.enable_migration_key = true`
+
+This adds and maintains a BIGINT column named `__orsx_mig_id` and uses it as the rewrite key.
+
+```rust
+use orsx::migrations::config::MigrationConfig;
+use orsx::prelude::*;
+
+let cfg = MigrationConfig {
+    enable_migration_key: true,
     ..MigrationConfig::default()
 };
 
@@ -232,6 +254,29 @@ There is also:
 
 Unsupported types should be treated as “not implemented yet” rather than “silently coerced”.
 
+### Example: JSONB as `JsonbText`
+
+If you want to scan JSONB without parsing into a typed struct, use `sqlx::types::JsonValue` (or `sqlx::types::Json<...>`) in your Rust struct;
+`#[derive(orsx::OrsxColumnar)]` maps it to `ColumnarType::JsonbText`.
+
+```rust
+use sqlx::types::JsonValue;
+use orsx::columnar::OrsxColumnar;
+
+#[derive(orsx::OrsxColumnar)]
+struct MyTable {
+    id: i64,
+    payload: JsonValue, // JSONB column
+}
+
+let schema = MyTable::columnar_schema()?;
+```
+
+Notes:
+
+- `JsonbText` stores the JSON value as UTF-8 text bytes.
+- JSONB does not preserve key ordering or input formatting; the stored bytes are the JSON text received from the Postgres binary protocol.
+
 ### Example: schema from a struct (no rewrite of your struct)
 
 `#[derive(orsx::OrsxColumnar)]` generates:
@@ -271,6 +316,32 @@ Notes:
 - The `*_unchecked` name is intentional: ORSX does not parse or sanitize your SQL. Use parameter binding for values.
 - For the row-wise reader, `select_sql` must outlive the reader (pass a long-lived `&str`, not a temporary `String`).
 
+### Example: choosing the reader explicitly
+
+Direct COPY BINARY:
+
+```rust
+use orsx::columnar::{ColumnarBatch, CopyBinaryBatchReader};
+
+let schema = MyTable::columnar_schema()?;
+let mut batch = ColumnarBatch::new(schema.clone(), 100_000)?;
+
+let mut reader = CopyBinaryBatchReader::new_select_unchecked(conn, "SELECT name_, pwt FROM my_table", schema).await?;
+let _rows = reader.next_batch_into(&mut batch).await?;
+```
+
+Direct row-wise:
+
+```rust
+use orsx::columnar::{ColumnarBatch, RowWiseBatchReader};
+
+let schema = MyTable::columnar_schema()?;
+let mut batch = ColumnarBatch::new(schema.clone(), 100_000)?;
+
+let mut reader = RowWiseBatchReader::new_select_unchecked(conn, "SELECT name_, pwt FROM my_table", schema).await?;
+let _rows = reader.next_batch_into(&mut batch).await?;
+```
+
 ### Row-wise strict preflight (opt-in)
 
 If you use `RowWiseBatchReader` directly, you can opt into a one-time preflight check (performed on the first row):
@@ -305,6 +376,31 @@ Limitations:
 If you want preflight while using `ColumnarBatchReader` (including `Auto(...)`), use:
 
 - `ColumnarBatchReader::new_select_unchecked_with_row_wise_config(..., Some(row_wise_cfg))`
+
+Example:
+
+```rust
+use orsx::columnar::{ColumnarBatch, ColumnarBatchReader, ColumnarReaderMode, RowWiseBatchReaderConfig};
+
+let schema = MyTable::columnar_schema()?;
+let mut batch = ColumnarBatch::new(schema.clone(), 100_000)?;
+
+let cfg = RowWiseBatchReaderConfig {
+    validate_column_count: true,
+    validate_column_names: true,
+    validate_type_compatible: true,
+};
+
+let mut reader = ColumnarBatchReader::new_select_unchecked_with_row_wise_config(
+    conn,
+    "SELECT name_, pwt FROM my_table",
+    schema,
+    ColumnarReaderMode::Auto(Default::default()),
+    Some(cfg),
+).await?;
+
+let _rows = reader.next_batch_into(&mut batch).await?;
+```
 
 ### Accessing columns
 
@@ -366,6 +462,24 @@ let raw: Vec<u8> = sqlx::query("SELECT payload FROM my_vecs WHERE id = $1")
     .try_get(0)?;
 
 let decoded = Compressed::<f64>::decode_envelope(&raw)?;
+assert_eq!(decoded.as_slice(), &[1.0, 2.0, 3.0]);
+```
+
+If you prefer, you can bind `Compressed<T>` directly (it implements SQLx `Type/Encode/Decode` for Postgres):
+
+```rust
+use orsx::Compressed;
+
+sqlx::query("INSERT INTO my_vecs (id, payload) VALUES ($1, $2)")
+    .bind("row1")
+    .bind(Compressed(vec![1.0_f64, 2.0, 3.0]))
+    .execute(&pool)
+    .await?;
+
+let decoded: Compressed<f64> = sqlx::query_scalar("SELECT payload FROM my_vecs WHERE id = $1")
+    .bind("row1")
+    .fetch_one(&pool)
+    .await?;
 assert_eq!(decoded.as_slice(), &[1.0, 2.0, 3.0]);
 ```
 
@@ -440,6 +554,10 @@ From `protocols/orsx2_evidence/columnar_trials.md`:
   - 100k × 500 cols: COPY → `ColumnarBatch` `2.430023982s`, row-wise → `ColumnarBatch` `2.892875905s`
 - 2026-01-14 14:41:55Z:
   - 1M × 50 cols: COPY → `ColumnarBatch` `2.75208442s`, row-wise → `ColumnarBatch` `2.528227132s` (row-wise is faster here)
+- 2026-01-15 09:23:12Z:
+  - 100k × 50 cols: COPY → `ColumnarBatch` `280.819598ms`, row-wise → `ColumnarBatch` `267.554416ms`
+  - 100k × 500 cols: COPY → `ColumnarBatch` `2.471189591s`, row-wise → `ColumnarBatch` `2.798175158s`
+  - 1M × 50 cols: COPY → `ColumnarBatch` `2.757631491s`, row-wise → `ColumnarBatch` `2.523348916s`
 
 Exact commands used for these trials are recorded in the log entries.
 
@@ -470,12 +588,23 @@ Useful commands:
 
 - Unit tests (no DB): `cargo test -p orsx --lib`
 - DB correctness tests (require Postgres):
+  - `cargo test -p orsx --tests` (runs all integration tests; requires Postgres)
   - `cargo test -p orsx --test columnar_copy_binary --release`
+  - `cargo test -p orsx --test columnar_jsonb`
   - `cargo test -p orsx --test migrations_strict_correctness`
   - `cargo test -p orsx --test migrations_indexes_idempotency`
 - Perf / large-table tests (ignored by default; require Postgres and time):
   - `cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
   - `cargo test -p orsx --test migrations_online_big_uuid --release -- --ignored --nocapture`
+
+### Tests and perf commands run for this README update
+
+This checkout was validated with:
+
+- `cargo test -p orsx --tests`
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=1000000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
 
 Some large-table tests create the `uuid-ossp` extension (`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`).
 

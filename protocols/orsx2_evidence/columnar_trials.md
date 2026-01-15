@@ -198,3 +198,46 @@ Results:
 
 Notes:
 - On this workload (narrower but much larger row count), COPY is slightly slower than row-wise; wide-table workloads still strongly favor COPY.
+
+### 2026-01-15 09:23:12Z — Release rerun after add-ons (JSONB + preflight + index matching changes)
+
+Machine:
+- CPU: Intel(R) Xeon(R) W-2295 CPU @ 3.00GHz (36 vCPU / 18 cores)
+- RAM: 503GiB
+- OS: Linux 5.15.0-156-generic x86_64
+
+Postgres:
+- Client version: `psql (PostgreSQL) 14.20 (Ubuntu 14.20-0ubuntu0.22.04.1)`
+- Server version: (not measured in this run; uses `ORSX_TEST_DATABASE_URL`)
+
+Command:
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_COL_ROWS=1000000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+
+Dataset / query:
+- Rows: 100,000 and 1,000,000
+- Columns:
+  - 50 cols: `id BIGINT` + 47×`DOUBLE PRECISION NULL` + `t TEXT NULL` + `by BYTEA NULL`
+  - 500 cols: `id BIGINT` + 497×`DOUBLE PRECISION NULL` + `t TEXT NULL` + `by BYTEA NULL`
+- NULL rate: `~10%` on numeric/text/bytea columns (`gs % 10 == 0`)
+- Query: `SELECT <all columns> FROM orscol_perf ORDER BY id`
+
+Implementation:
+- Reader (COPY): `COPY (SELECT ...) TO STDOUT (FORMAT BINARY)` parsed into `ColumnarBatch`
+- Reader (row-wise): `sqlx::query(...).fetch(...)` building the same `ColumnarBatch`
+- Workspace reuse: no (this perf test is single-shot)
+
+Results:
+- 100k × 50 cols:
+  - COPY → `ColumnarBatch`: `280.819598ms`
+  - Row-wise → `ColumnarBatch`: `267.554416ms`
+- 100k × 500 cols:
+  - COPY → `ColumnarBatch`: `2.471189591s`
+  - Row-wise → `ColumnarBatch`: `2.798175158s`
+- 1M × 50 cols:
+  - COPY → `ColumnarBatch`: `2.757631491s`
+  - Row-wise → `ColumnarBatch`: `2.523348916s`
+
+Notes:
+- Add-ons in this sprint (row-wise preflight, partial/expression index equivalence safety, JSONB columnar type) do not materially affect this specific perf trial’s query shape (no JSONB column).
