@@ -46,7 +46,22 @@ impl Migrations {
             }
 
             let start = Instant::now();
-            let expected = planning::expected_schema_from_spec(table_name, &spec);
+            let mut expected = planning::expected_schema_from_spec(table_name, &spec);
+            if cfg.enable_migration_key && planning::primary_key_column(&spec).is_none() {
+                // Ensure the migration key exists on the live table (no rewrite required just
+                // to materialize the key).
+                online::ensure_migration_key_for_table(pool, table_name, cfg).await?;
+                // Add-on v1.2: when enabled and the spec does not provide exactly one PK,
+                // treat the internal migration key as part of the expected live schema.
+                expected.columns.push(introspection::ColumnInfo {
+                    name: online::MIGRATION_KEY_COL.to_string(),
+                    sql_type: "BIGINT".to_string(),
+                    nullable: false,
+                    position: expected.columns.len() as i32,
+                    is_primary_key: false,
+                    is_unique: true,
+                });
+            }
 
             // Fast-path, non-rewrite migrations (must remain safe at scale).
             // Iterate because some safe operations (e.g. ADD COLUMN) can reveal

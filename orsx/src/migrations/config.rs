@@ -31,6 +31,14 @@ pub struct MigrationConfig {
     /// Default path remains single-threaded and deterministic.
     pub parallel_backfill: bool,
     pub parallel_backfill_workers: usize,
+
+    /// Add-on v1.2: if enabled and the Rust spec does not define exactly one primary key column,
+    /// ORSX will add and maintain an internal migration key column `__orsx_mig_id` (BIGINT),
+    /// and use it as the online rewrite key.
+    ///
+    /// This is intended for large-table online rewrites where a single key is required for
+    /// deterministic keyset chunking and changelog catch-up.
+    pub enable_migration_key: bool,
 }
 
 impl Default for MigrationConfig {
@@ -53,6 +61,7 @@ impl Default for MigrationConfig {
             synchronous_commit_off: false,
             parallel_backfill: false,
             parallel_backfill_workers: 4,
+            enable_migration_key: false,
         }
     }
 }

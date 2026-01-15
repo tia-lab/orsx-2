@@ -31,8 +31,9 @@ Introduce a **migration key** concept used only for online rewrite mechanics:
 
 - If a table has a suitable single-column PK, use it.
 - Otherwise, create and use an internal key column (example name):
-  - `__orsx_mig_id UUID NOT NULL DEFAULT gen_random_uuid()` (preferred), or
-  - `__orsx_mig_id BIGINT GENERATED ALWAYS AS IDENTITY`
+  - `__orsx_mig_id BIGINT` (no Postgres extensions; preferred for this repo)
+
+Chosen (v1.2): BIGINT, no extensions.
 
 The migration key must have:
 
@@ -73,38 +74,21 @@ Fail deterministically if:
 ### 1.6 Decision points
 
 - Is adding an internal `__orsx_mig_id` allowed?
-- Which type is preferred (`UUID` vs `BIGINT identity`)?
+- Which type is preferred?
+  - v1.2 choice: `BIGINT` (no extensions)
 - Is it acceptable to keep the migration key permanently (recommended), or must it be removable?
 
-## 2) Add-on B — Multi-schema support (beyond `public`)
+## 2) Add-on B — Multi-schema support (beyond `public`)  (MOVED TO v1.3)
 
-### 2.1 Motivation
+This add-on is moved to:
 
-Some deployments use multiple schemas for isolation (`tenant_...`, `app`, `raw`, etc.).
+- `protocols/orsx2_specs/ADDONS_V1_3_MULTI_SCHEMA_SPEC.md:1`
 
-### 2.2 Proposal
+Do not implement multi-schema under v1.2.
 
-Add schema-aware naming to the migration system:
+## 7) References
 
-- Table identity becomes `(schema, table)`.
-- All introspection queries must filter by schema, not assume `public`.
-- Identifier quoting must support `schema.table` safely:
-  - quote schema and table separately.
-
-### 2.3 Failure contract
-
-Fail deterministically if:
-
-- schema is not provided in strict mode and default schema behavior is ambiguous.
-
-### 2.4 Required tests/evidence
-
-- DB integration: create/migrate two schemas with same table name; verify isolation.
-- DB integration: online rewrite operates inside a non-public schema.
-
-### 2.5 Decision points
-
-- Do we require schema everywhere, or allow default `public` when not set?
+- v1.3 multi-schema spec: `protocols/orsx2_specs/ADDONS_V1_3_MULTI_SCHEMA_SPEC.md:1`
 
 ## 3) Add-on C — Advanced index matching (partial / expression / INCLUDE / opclass / collation)
 
@@ -188,12 +172,35 @@ an explicit “preflight” error describing schema mismatches before scanning.
 Add an opt-in strict preflight mode for row-wise reads:
 
 - validate `row.columns().len() == schema.len()`,
-- optionally validate returned column names match `ColumnarField.name` when provided.
+- optionally validate returned column names match `ColumnarField.name` when provided,
+- run once, on the first observed row (prevents per-row overhead).
+
+Implementation surface:
+
+- `RowWiseBatchReaderConfig { validate_column_count: bool, validate_column_names: bool }`
+  - default: all `false` (opt-in)
+- `RowWiseBatchReader::with_config(cfg)` to enable.
+
+Preflight behavior:
+
+- If both flags are `false`, preflight is a no-op.
+- If `validate_column_count` is enabled and counts differ, return a deterministic error string:
+  - `row-wise preflight failed: column count mismatch (expected N, got M)`
+- If `validate_column_names` is enabled:
+  - only fields with `ColumnarField.name = Some(...)` are checked,
+  - mismatch returns:
+    - `row-wise preflight failed: column name mismatch at index i (expected `x`, got `y`)`
+
+Limitations:
+
+- Empty result sets cannot be preflighted (no first row), so the preflight does not run.
+- Type mismatches are still detected by `try_get` during decoding (not preflighted).
 
 ### 5.3 Required tests
 
 - DB integration: mismatch column count triggers deterministic “preflight failed” error.
 - DB integration: name mismatch triggers deterministic error when name checking is enabled.
+  - Tests should avoid shared table names across parallel execution.
 
 ### 5.4 Decision points
 
@@ -207,4 +214,3 @@ An add-on is promoted into core scope only when:
 - tests exist and pass,
 - evidence is appended when performance is involved,
 - README documents behavior and limitations.
-

@@ -3,6 +3,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
+use sqlx::Column;
 use sqlx::postgres::PgConnection;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -1201,7 +1202,24 @@ impl<'c> CopyBinaryBatchReader<'c> {
 pub struct RowWiseBatchReader<'c> {
     rows: BoxStream<'c, std::result::Result<PgRow, sqlx::Error>>,
     schema: ColumnarSchema,
+    cfg: RowWiseBatchReaderConfig,
+    preflight_done: bool,
     done: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowWiseBatchReaderConfig {
+    pub validate_column_count: bool,
+    pub validate_column_names: bool,
+}
+
+impl Default for RowWiseBatchReaderConfig {
+    fn default() -> Self {
+        Self {
+            validate_column_count: false,
+            validate_column_names: false,
+        }
+    }
 }
 
 impl<'c> RowWiseBatchReader<'c> {
@@ -1217,8 +1235,15 @@ impl<'c> RowWiseBatchReader<'c> {
         Ok(Self {
             rows,
             schema,
+            cfg: RowWiseBatchReaderConfig::default(),
+            preflight_done: false,
             done: false,
         })
+    }
+
+    pub fn with_config(mut self, cfg: RowWiseBatchReaderConfig) -> Self {
+        self.cfg = cfg;
+        self
     }
 
     pub fn schema(&self) -> &ColumnarSchema {
@@ -1247,6 +1272,11 @@ impl<'c> RowWiseBatchReader<'c> {
                 }
                 Err(e) => return Err(Error::Database(e)),
             };
+
+            if !self.preflight_done {
+                self.run_preflight(&row)?;
+                self.preflight_done = true;
+            }
 
             for (col_idx, f) in self.schema.fields().iter().enumerate() {
                 match f.ty {
@@ -1334,6 +1364,39 @@ impl<'c> RowWiseBatchReader<'c> {
         }
 
         Ok(out.row_count())
+    }
+
+    fn run_preflight(&self, row: &PgRow) -> Result<()> {
+        if !self.cfg.validate_column_count && !self.cfg.validate_column_names {
+            return Ok(());
+        }
+
+        let got_cols = row.columns().len();
+        let exp_cols = self.schema.len();
+
+        if self.cfg.validate_column_count && got_cols != exp_cols {
+            return Err(Error::Other(format!(
+                "row-wise preflight failed: column count mismatch (expected {exp_cols}, got {got_cols})"
+            )));
+        }
+
+        if self.cfg.validate_column_names {
+            let cols = row.columns();
+            let n = exp_cols.min(cols.len());
+            for i in 0..n {
+                let expected = self.schema.fields()[i].name.as_deref();
+                if let Some(expected) = expected {
+                    let got = cols[i].name();
+                    if got != expected {
+                        return Err(Error::Other(format!(
+                            "row-wise preflight failed: column name mismatch at index {i} (expected `{expected}`, got `{got}`)"
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

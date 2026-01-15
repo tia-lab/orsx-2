@@ -1,4 +1,5 @@
 use crate::{quote_identifier, indexes::IndexInfo, schema::TableSpec};
+use crate::schema::ColumnSpec;
 
 use super::introspection::{ColumnInfo, TableSchema};
 use super::config::MigrationConfig;
@@ -31,6 +32,19 @@ pub fn expected_schema_from_spec(table_name: &str, spec: &TableSpec) -> TableSch
             })
             .collect(),
     }
+}
+
+pub(crate) fn primary_key_column(spec: &TableSpec) -> Option<&'static ColumnSpec> {
+    let mut pk = None;
+    for c in spec.columns {
+        if c.primary_key {
+            if pk.is_some() {
+                return None;
+            }
+            pk = Some(c);
+        }
+    }
+    pk
 }
 
 pub fn diff_schema(current: &TableSchema, expected: &TableSchema) -> Vec<SchemaDiff> {

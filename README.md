@@ -266,6 +266,35 @@ Notes:
 - The `*_unchecked` name is intentional: ORSX does not parse or sanitize your SQL. Use parameter binding for values.
 - For the row-wise reader, `select_sql` must outlive the reader (pass a long-lived `&str`, not a temporary `String`).
 
+### Row-wise strict preflight (opt-in)
+
+If you use `RowWiseBatchReader` directly, you can opt into a one-time preflight check (performed on the first row):
+
+- `validate_column_count`: `row.columns().len()` must match `ColumnarSchema::len()`
+- `validate_column_names`: returned column names must match `ColumnarField.name` (when `Some`)
+
+```rust
+use orsx::columnar::{ColumnarBatch, RowWiseBatchReader, RowWiseBatchReaderConfig};
+
+let schema = MyTable::columnar_schema()?;
+let mut batch = ColumnarBatch::new(schema.clone(), 100_000)?;
+
+let sql = "SELECT name_, pwt FROM my_table";
+let mut reader = RowWiseBatchReader::new_select_unchecked(conn, sql, schema.clone())
+    .await?
+    .with_config(RowWiseBatchReaderConfig {
+        validate_column_count: true,
+        validate_column_names: true,
+    });
+
+let _rows = reader.next_batch_into(&mut batch).await?;
+```
+
+Limitations:
+
+- Empty result sets cannot be preflighted (no first row), so the preflight does not run.
+- Types are not “preflighted”; if the SQL types do not match the schema, `try_get` fails when decoding.
+
 ### Accessing columns
 
 ```rust

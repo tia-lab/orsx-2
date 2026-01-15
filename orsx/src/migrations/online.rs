@@ -5,6 +5,8 @@ use crate::{quote_identifier, Error, Result};
 use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
+pub(crate) const MIGRATION_KEY_COL: &str = "__orsx_mig_id";
+
 #[derive(Debug, Clone, Copy)]
 struct CutoverStats {
     lock_ms: u64,
@@ -124,18 +126,40 @@ pub async fn online_rewrite_table(
     let total_start = Instant::now();
 
     // Phase 0: validate that online migration prerequisites are satisfied.
-    let pk = primary_key_column(spec).ok_or_else(|| {
-        Error::MigrationNeeded("online rewrite requires exactly one primary key column".to_string())
-    })?;
-
-    let current_pk = current
-        .columns
-        .iter()
-        .find(|c| c.name == pk.name)
-        .ok_or_else(|| Error::MigrationNeeded("primary key missing in current schema".to_string()))?;
+    //
+    // Baseline: online rewrite uses exactly one primary key column from the Rust spec.
+    // Add-on v1.2: if enabled and the Rust spec does not provide exactly one PK, use an internal
+    // BIGINT migration key (`__orsx_mig_id`) and ensure it exists/populated/unique on the live table.
+    let (pk_name, current_pk): (&'static str, ColumnInfo) =
+        if let Some(pk) = super::planning::primary_key_column(spec) {
+        let current_pk = current.columns.iter().find(|c| c.name == pk.name).ok_or_else(|| {
+            Error::MigrationNeeded("primary key missing in current schema".to_string())
+        })?;
+        (pk.name, current_pk.clone())
+    } else if cfg.enable_migration_key {
+        ensure_migration_key(pool, table_name, cfg).await?;
+        let updated = super::introspection::read_table_schema(pool, table_name).await?;
+        let current_pk = updated
+            .columns
+            .iter()
+            .find(|c| c.name == MIGRATION_KEY_COL)
+            .ok_or_else(|| {
+                Error::MigrationNeeded("migration key missing after ensure".to_string())
+            })?
+            .clone();
+        (MIGRATION_KEY_COL, current_pk)
+    } else {
+        return Err(Error::MigrationNeeded(
+            "online rewrite requires exactly one primary key column (or enable_migration_key)".to_string(),
+        ));
+    };
 
     // Determine whether we can generate safe expressions for all expected columns.
-    let col_exprs = build_column_exprs(current, spec)?;
+    let mut col_exprs = build_column_exprs(current, spec)?;
+    if pk_name == MIGRATION_KEY_COL {
+        // Always copy the migration key into the shadow table.
+        col_exprs.push((MIGRATION_KEY_COL, quote_identifier(MIGRATION_KEY_COL)));
+    }
 
     // Stable names.
     let ts = std::time::SystemTime::now()
@@ -175,6 +199,13 @@ pub async fn online_rewrite_table(
             }
             lines.push(line);
         }
+        if pk_name == MIGRATION_KEY_COL {
+            // Shadow table must include the migration key column to preserve identity across swap.
+            lines.push(format!(
+                "{} BIGINT NOT NULL",
+                quote_identifier(MIGRATION_KEY_COL)
+            ));
+        }
         format!(
             "CREATE TABLE IF NOT EXISTS {} (\n  {}\n)",
             quote_identifier(&shadow),
@@ -183,16 +214,35 @@ pub async fn online_rewrite_table(
     };
 
     sqlx::query(&create_sql).execute(pool).await?;
+    if pk_name == MIGRATION_KEY_COL {
+        // Shadow table must have fast lookup on the migration key for catch-up operations.
+        let idx_name = super::planning::derive_index_name(
+            &shadow,
+            &crate::IndexInfo {
+                name: "",
+                columns: &[MIGRATION_KEY_COL],
+                unique: true,
+                index_type: crate::IndexType::BTree,
+            },
+        );
+        let sql = format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})",
+            quote_identifier(&idx_name),
+            quote_identifier(&shadow),
+            quote_identifier(MIGRATION_KEY_COL),
+        );
+        sqlx::query(&sql).execute(pool).await?;
+    }
 
     // Phase 2: create changelog table and trigger that records changed PKs.
-    create_changelog(pool, &changelog, current_pk).await?;
+    create_changelog(pool, &changelog, &current_pk).await?;
     create_mirror_trigger(
         pool,
         &trigger_fn,
         &trigger_name,
         table_name,
         &changelog,
-        pk.name,
+        pk_name,
         &col_exprs,
         current,
     )
@@ -208,7 +258,7 @@ pub async fn online_rewrite_table(
             &mut conn,
             table_name,
             &shadow,
-            pk.name,
+            pk_name,
             &current_pk.sql_type,
             &col_exprs,
             cfg,
@@ -229,7 +279,7 @@ pub async fn online_rewrite_table(
             table_name,
             &shadow,
             &changelog,
-            pk.name,
+            pk_name,
             &current_pk.sql_type,
             &col_exprs,
             cfg,
@@ -249,7 +299,7 @@ pub async fn online_rewrite_table(
         &changelog,
         &trigger_name,
         &trigger_fn,
-        pk.name,
+        pk_name,
         &current_pk.sql_type,
         &col_exprs,
         cfg,
@@ -276,18 +326,7 @@ pub async fn online_rewrite_table(
     Ok(())
 }
 
-fn primary_key_column(spec: &TableSpec) -> Option<&'static crate::schema::ColumnSpec> {
-    let mut pk = None;
-    for c in spec.columns {
-        if c.primary_key {
-            if pk.is_some() {
-                return None;
-            }
-            pk = Some(c);
-        }
-    }
-    pk
-}
+// `primary_key_column` lives in `planning` (shared by migrations entry + online rewrite).
 
 fn build_column_exprs(
     current: &TableSchema,
@@ -344,6 +383,126 @@ async fn create_changelog(pool: &PgPool, changelog: &str, pk: &ColumnInfo) -> Re
     );
     sqlx::query(&sql).execute(pool).await?;
     Ok(())
+}
+
+async fn ensure_migration_key(
+    pool: &PgPool,
+    table_name: &str,
+    cfg: &MigrationConfig,
+) -> Result<()> {
+    // Ensure the migration key exists, has a default for new writes, is fully populated,
+    // is NOT NULL, and has uniqueness semantics.
+    //
+    // This uses only core Postgres features (no extensions).
+    let schema = super::introspection::read_table_schema(pool, table_name).await?;
+    let existing = schema.columns.iter().find(|c| c.name == MIGRATION_KEY_COL);
+
+    if let Some(col) = existing {
+        if col.sql_type != "BIGINT" {
+            return Err(Error::MigrationNeeded(format!(
+                "migration key column `{MIGRATION_KEY_COL}` exists but is not BIGINT (found {})",
+                col.sql_type
+            )));
+        }
+    } else {
+        // Add as nullable first (so existing rows can be backfilled).
+        let sql = format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} BIGINT",
+            quote_identifier(table_name),
+            quote_identifier(MIGRATION_KEY_COL),
+        );
+        sqlx::query(&sql).execute(pool).await?;
+    }
+
+    // Create a deterministic sequence name. Keep it lowercase so `$1::regclass` resolves reliably
+    // without requiring quoting inside the regclass literal.
+    let canon = format!("orsx2_migseq|table={table_name}|col={MIGRATION_KEY_COL}");
+    let seq = format!("orsx2_migseq_{:08x}", crc32fast::hash(canon.as_bytes()));
+    let seq_sql = format!("CREATE SEQUENCE IF NOT EXISTS {}", quote_identifier(&seq));
+    sqlx::query(&seq_sql).execute(pool).await?;
+
+    let seq_lit = format!("'{}'::regclass", seq.replace('\'', "''"));
+
+    // Set default for new writes.
+    let default_sql = format!(
+        "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT nextval({})",
+        quote_identifier(table_name),
+        quote_identifier(MIGRATION_KEY_COL),
+        seq_lit,
+    );
+    sqlx::query(&default_sql).execute(pool).await?;
+
+    // Backfill existing NULLs in bounded chunks.
+    let chunk = cfg.online_chunk_size.max(1);
+    loop {
+        let sql = format!(
+            r#"
+            WITH c AS (
+              SELECT ctid
+              FROM {t}
+              WHERE {k} IS NULL
+              LIMIT $1
+            )
+            UPDATE {t}
+            SET {k} = nextval({seq_lit})
+            FROM c
+            WHERE {t}.ctid = c.ctid
+            "#,
+            t = quote_identifier(table_name),
+            k = quote_identifier(MIGRATION_KEY_COL),
+            seq_lit = seq_lit,
+        );
+        let updated = sqlx::query(&sql)
+            .bind(chunk)
+            .execute(pool)
+            .await?
+            .rows_affected();
+
+        if updated == 0 {
+            break;
+        }
+
+        if cfg.online_sleep_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(cfg.online_sleep_ms)).await;
+        }
+    }
+
+    // Enforce NOT NULL after backfill.
+    let not_null = format!(
+        "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
+        quote_identifier(table_name),
+        quote_identifier(MIGRATION_KEY_COL),
+    );
+    sqlx::query(&not_null).execute(pool).await?;
+
+    // Uniqueness semantics: unique index concurrently (idempotent).
+    let idx_name = super::planning::derive_index_name(
+        table_name,
+        &crate::IndexInfo {
+            name: "",
+            columns: &[MIGRATION_KEY_COL],
+            unique: true,
+            index_type: crate::IndexType::BTree,
+        },
+    );
+    let create_idx = format!(
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} ({})",
+        quote_identifier(&idx_name),
+        quote_identifier(table_name),
+        quote_identifier(MIGRATION_KEY_COL),
+    );
+    let mut conn = pool.acquire().await?;
+    sqlx::query(&create_idx).execute(&mut *conn).await?;
+
+    Ok(())
+}
+
+pub(crate) async fn ensure_migration_key_for_table(
+    pool: &PgPool,
+    table_name: &str,
+    cfg: &MigrationConfig,
+) -> Result<()> {
+    ensure_migration_key(pool, table_name, cfg).await
 }
 
 async fn create_mirror_trigger(
