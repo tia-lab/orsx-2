@@ -228,6 +228,7 @@ There is also:
 - `TimestampTzMicros` (i64 microseconds since Unix epoch)
 - `Utf8` (raw bytes + optional UTF-8 validation)
 - `Bytes` (raw bytes)
+- `JsonbText` (JSON/JSONB, stored as UTF-8 JSON text; COPY BINARY strips JSONB version byte)
 
 Unsupported types should be treated as “not implemented yet” rather than “silently coerced”.
 

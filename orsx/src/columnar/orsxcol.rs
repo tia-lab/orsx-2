@@ -18,6 +18,7 @@ fn type_id(ty: ColumnarType) -> u16 {
         ColumnarType::TimestampTzMicros => 8,
         ColumnarType::Utf8 => 9,
         ColumnarType::Bytes => 10,
+        ColumnarType::JsonbText => 11,
     }
 }
 
@@ -33,6 +34,7 @@ fn type_from_id(id: u16) -> Result<ColumnarType> {
         8 => Ok(ColumnarType::TimestampTzMicros),
         9 => Ok(ColumnarType::Utf8),
         10 => Ok(ColumnarType::Bytes),
+        11 => Ok(ColumnarType::JsonbText),
         _ => Err(Error::Other(format!("unknown column type id: {id}"))),
     }
 }

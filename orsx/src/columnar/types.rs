@@ -25,6 +25,8 @@ pub enum ColumnarType {
     TimestampTzMicros,
     Utf8,
     Bytes,
+    /// JSONB as UTF-8 JSON text (COPY BINARY strips JSONB version byte).
+    JsonbText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +178,7 @@ pub(crate) enum ColumnData {
 impl ColumnData {
     pub(crate) fn new(ty: ColumnarType) -> Result<Self> {
         match ty {
-            ColumnarType::Utf8 | ColumnarType::Bytes => Ok(ColumnData::Var {
+            ColumnarType::Utf8 | ColumnarType::Bytes | ColumnarType::JsonbText => Ok(ColumnData::Var {
                 ty,
                 validity: ValidityBitmap::new(),
                 offsets: vec![0],
@@ -1039,21 +1041,58 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         if validate_utf8 && std::str::from_utf8(bytes).is_err() {
                             return Err(Error::Other("invalid UTF-8 in TEXT column".to_string()));
                         }
+                        let add: u32 = bytes
+                            .len()
+                            .try_into()
+                            .map_err(|_| Error::Other("var chunk too large".to_string()))?;
+                        let new_total = total_len
+                            .checked_add(add)
+                            .ok_or_else(|| Error::Other("var column too large".to_string()))?;
+                        data.extend_from_slice(bytes);
+                        *total_len = new_total;
+                        offsets.push(new_total);
                     }
                     ColumnarType::Bytes => {
+                        let add: u32 = bytes
+                            .len()
+                            .try_into()
+                            .map_err(|_| Error::Other("var chunk too large".to_string()))?;
+                        let new_total = total_len
+                            .checked_add(add)
+                            .ok_or_else(|| Error::Other("var column too large".to_string()))?;
+                        data.extend_from_slice(bytes);
+                        *total_len = new_total;
+                        offsets.push(new_total);
+                    }
+                    ColumnarType::JsonbText => {
+                        if bytes.is_empty() {
+                            return Err(Error::Other(
+                                "invalid JSONB payload (missing version byte)".to_string(),
+                            ));
+                        }
+                        if bytes[0] != 1 {
+                            return Err(Error::Other(format!(
+                                "unsupported JSONB format version {}",
+                                bytes[0]
+                            )));
+                        }
+                        let json = &bytes[1..];
+                        if validate_utf8 && std::str::from_utf8(json).is_err() {
+                            return Err(Error::Other("invalid UTF-8 in JSONB column".to_string()));
+                        }
+                        let add: u32 = json
+                            .len()
+                            .try_into()
+                            .map_err(|_| Error::Other("var chunk too large".to_string()))?;
+                        let new_total = total_len
+                            .checked_add(add)
+                            .ok_or_else(|| Error::Other("var column too large".to_string()))?;
+                        data.extend_from_slice(json);
+                        *total_len = new_total;
+                        offsets.push(new_total);
                     }
                     _ => return Err(Error::Other("internal type mismatch".to_string())),
                 }
-                let add: u32 = bytes
-                    .len()
-                    .try_into()
-                    .map_err(|_| Error::Other("var chunk too large".to_string()))?;
-                let new_total = total_len
-                    .checked_add(add)
-                    .ok_or_else(|| Error::Other("var column too large".to_string()))?;
-                data.extend_from_slice(bytes);
-                *total_len = new_total;
-                offsets.push(new_total);
             }
         }
 
@@ -1362,6 +1401,14 @@ impl<'c> RowWiseBatchReader<'c> {
                             None => out.push_null(col_idx)?,
                         }
                     }
+                    ColumnarType::JsonbText => {
+                        let v: Option<&sqlx::types::JsonRawValue> =
+                            row.try_get(col_idx).map_err(Error::Database)?;
+                        match v {
+                            Some(v) => out.push_utf8(col_idx, v.get())?,
+                            None => out.push_null(col_idx)?,
+                        }
+                    }
                 }
             }
 
@@ -1436,6 +1483,7 @@ fn columnar_type_hint(ty: ColumnarType) -> &'static str {
         ColumnarType::TimestampTzMicros => "TIMESTAMPTZ",
         ColumnarType::Utf8 => "TEXT/VARCHAR",
         ColumnarType::Bytes => "BYTEA",
+        ColumnarType::JsonbText => "JSON/JSONB",
     }
 }
 
@@ -1451,6 +1499,9 @@ fn columnar_type_compatible(ty: ColumnarType, got: &<Postgres as sqlx::Database>
         ColumnarType::TimestampTzMicros => <crate::SqlxTimestamp as SqlxType<Postgres>>::compatible(got),
         ColumnarType::Utf8 => <&str as SqlxType<Postgres>>::compatible(got),
         ColumnarType::Bytes => <&[u8] as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::JsonbText => {
+            <sqlx::types::Json<&sqlx::types::JsonRawValue> as SqlxType<Postgres>>::compatible(got)
+        }
     }
 }
 

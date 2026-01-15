@@ -156,7 +156,10 @@ Common requests include:
 
 Pick a minimal next set:
 
-- `JSONB` → `Bytes` (raw JSONB bytes) or `Utf8` (text) (must be explicit).
+- `JSONB` → support a dedicated `JsonbText` columnar type:
+  - stored as UTF-8 JSON text bytes (same layout as `Utf8`),
+  - COPY BINARY input strips the leading JSONB format version byte (must be `1`),
+  - row-wise uses `sqlx::types::JsonRawValue` to avoid parsing into structured data.
 - `NUMERIC` → either:
   - reject (remain unsupported), or
   - encode as canonical string bytes (slower, but deterministic), or

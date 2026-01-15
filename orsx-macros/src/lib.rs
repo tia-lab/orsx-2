@@ -379,6 +379,8 @@ fn rust_type_to_columnar_type(ty: &Type) -> syn::Result<proc_macro2::TokenStream
 
     let ts = match last {
         "String" | "str" => quote! { orsx::columnar::ColumnarType::Utf8 },
+        // JSONB/JSON: require SQLx json feature and use `sqlx::types::Json*` types in Rust.
+        "Json" | "JsonValue" => quote! { orsx::columnar::ColumnarType::JsonbText },
         "bool" => quote! { orsx::columnar::ColumnarType::Bool },
         "i16" => quote! { orsx::columnar::ColumnarType::I16 },
         "i32" => quote! { orsx::columnar::ColumnarType::I32 },

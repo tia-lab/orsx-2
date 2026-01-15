@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.dependencies]
 # Core database
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json"] }
 bytes = "1"
 futures-util = "0.3"
 
