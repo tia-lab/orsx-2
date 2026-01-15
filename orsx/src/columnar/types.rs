@@ -4,6 +4,9 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 use sqlx::Column;
+use sqlx::Postgres;
+use sqlx::TypeInfo;
+use sqlx::Type as SqlxType;
 use sqlx::postgres::PgConnection;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -1211,6 +1214,7 @@ pub struct RowWiseBatchReader<'c> {
 pub struct RowWiseBatchReaderConfig {
     pub validate_column_count: bool,
     pub validate_column_names: bool,
+    pub validate_type_compatible: bool,
 }
 
 impl Default for RowWiseBatchReaderConfig {
@@ -1218,6 +1222,7 @@ impl Default for RowWiseBatchReaderConfig {
         Self {
             validate_column_count: false,
             validate_column_names: false,
+            validate_type_compatible: false,
         }
     }
 }
@@ -1367,7 +1372,10 @@ impl<'c> RowWiseBatchReader<'c> {
     }
 
     fn run_preflight(&self, row: &PgRow) -> Result<()> {
-        if !self.cfg.validate_column_count && !self.cfg.validate_column_names {
+        if !self.cfg.validate_column_count
+            && !self.cfg.validate_column_names
+            && !self.cfg.validate_type_compatible
+        {
             return Ok(());
         }
 
@@ -1396,7 +1404,53 @@ impl<'c> RowWiseBatchReader<'c> {
             }
         }
 
+        if self.cfg.validate_type_compatible {
+            let cols = row.columns();
+            let n = exp_cols.min(cols.len());
+            for i in 0..n {
+                let exp_ty = self.schema.fields()[i].ty;
+                let got_ty = cols[i].type_info();
+                if !columnar_type_compatible(exp_ty, got_ty) {
+                    return Err(Error::Other(format!(
+                        "row-wise preflight failed: type mismatch at index {i} (expected {}, got {})",
+                        columnar_type_hint(exp_ty),
+                        got_ty.name()
+                    )));
+                }
+            }
+        }
+
         Ok(())
+    }
+}
+
+fn columnar_type_hint(ty: ColumnarType) -> &'static str {
+    match ty {
+        ColumnarType::Bool => "BOOL",
+        ColumnarType::I16 => "SMALLINT",
+        ColumnarType::I32 => "INTEGER",
+        ColumnarType::I64 => "BIGINT",
+        ColumnarType::F32 => "REAL",
+        ColumnarType::F64 => "DOUBLE PRECISION",
+        ColumnarType::Uuid => "UUID",
+        ColumnarType::TimestampTzMicros => "TIMESTAMPTZ",
+        ColumnarType::Utf8 => "TEXT/VARCHAR",
+        ColumnarType::Bytes => "BYTEA",
+    }
+}
+
+fn columnar_type_compatible(ty: ColumnarType, got: &<Postgres as sqlx::Database>::TypeInfo) -> bool {
+    match ty {
+        ColumnarType::Bool => <bool as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::I16 => <i16 as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::I32 => <i32 as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::I64 => <i64 as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::F32 => <f32 as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::F64 => <f64 as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::Uuid => <sqlx::types::Uuid as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::TimestampTzMicros => <crate::SqlxTimestamp as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::Utf8 => <&str as SqlxType<Postgres>>::compatible(got),
+        ColumnarType::Bytes => <&[u8] as SqlxType<Postgres>>::compatible(got),
     }
 }
 
@@ -1444,6 +1498,16 @@ impl<'c> ColumnarBatchReader<'c> {
         schema: ColumnarSchema,
         mode: ColumnarReaderMode,
     ) -> Result<Self> {
+        Self::new_select_unchecked_with_row_wise_config(conn, select_sql, schema, mode, None).await
+    }
+
+    pub async fn new_select_unchecked_with_row_wise_config(
+        conn: &'c mut PgConnection,
+        select_sql: &'c str,
+        schema: ColumnarSchema,
+        mode: ColumnarReaderMode,
+        row_wise_cfg: Option<RowWiseBatchReaderConfig>,
+    ) -> Result<Self> {
         enum Chosen {
             CopyBinary,
             RowWise,
@@ -1470,9 +1534,13 @@ impl<'c> ColumnarBatchReader<'c> {
             Chosen::CopyBinary => Ok(Self::Copy(
                 CopyBinaryBatchReader::new_select_unchecked(conn, select_sql, schema).await?,
             )),
-            Chosen::RowWise => Ok(Self::RowWise(
-                RowWiseBatchReader::new_select_unchecked(conn, select_sql, schema).await?,
-            )),
+            Chosen::RowWise => {
+                let mut r = RowWiseBatchReader::new_select_unchecked(conn, select_sql, schema).await?;
+                if let Some(cfg) = row_wise_cfg {
+                    r = r.with_config(cfg);
+                }
+                Ok(Self::RowWise(r))
+            }
         }
     }
 

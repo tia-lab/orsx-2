@@ -22,6 +22,11 @@ pub struct IndexIdentity {
     pub method: String,
     pub unique: bool,
     pub columns: Vec<String>,
+    /// `WHERE ...` predicate for partial indexes, as returned by `pg_get_expr(indpred, indrelid)`.
+    /// Normalized (trimmed, whitespace collapsed) for stable comparisons.
+    pub predicate: Option<String>,
+    /// True if the index includes expressions (e.g. `((lower(email)))`), not just table columns.
+    pub has_expressions: bool,
 }
 
 pub async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool> {
@@ -49,19 +54,27 @@ pub async fn read_table_index_identities(pool: &PgPool, table_name: &str) -> Res
     //
     // We consider only "ready + valid" indexes to avoid treating in-progress concurrent builds
     // as satisfying the schema.
-    let rows = sqlx::query_as::<_, (bool, String, Vec<String>)>(
+    let rows = sqlx::query_as::<_, (bool, String, Vec<String>, Option<String>, bool)>(
         r#"
         SELECT
           i.indisunique AS is_unique,
           am.amname AS method,
-          array_agg(a.attname ORDER BY k.ord) AS columns
+          COALESCE(
+            array_agg(a.attname ORDER BY k.ord) FILTER (WHERE k.attnum <> 0),
+            ARRAY[]::text[]
+          ) AS columns,
+          CASE
+            WHEN i.indpred IS NULL THEN NULL
+            ELSE pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+          END AS predicate,
+          bool_or(k.attnum = 0) OR (i.indexprs IS NOT NULL) AS has_expressions
         FROM pg_catalog.pg_index i
         JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
         JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
         JOIN pg_catalog.pg_am am ON am.oid = ic.relam
         JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-        JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+        LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
         WHERE n.nspname = 'public'
           AND t.relname = $1
           AND i.indisvalid
@@ -75,12 +88,33 @@ pub async fn read_table_index_identities(pool: &PgPool, table_name: &str) -> Res
 
     Ok(rows
         .into_iter()
-        .map(|(unique, method, columns)| IndexIdentity {
+        .map(|(unique, method, columns, predicate, has_expressions)| IndexIdentity {
             unique,
             method,
             columns,
+            predicate: predicate.map(normalize_index_predicate),
+            has_expressions,
         })
         .collect())
+}
+
+fn normalize_index_predicate(s: String) -> String {
+    // Keep this normalization deliberately minimal to avoid changing meaning:
+    // collapse whitespace and trim.
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 pub async fn read_table_schema(pool: &PgPool, table_name: &str) -> Result<TableSchema> {
@@ -167,6 +201,8 @@ pub async fn read_table_schema(pool: &PgPool, table_name: &str) -> Result<TableS
         WHERE n.nspname = 'public'
           AND t.relname = $1
           AND i.indisunique
+          AND i.indpred IS NULL
+          AND i.indexprs IS NULL
           AND array_length(i.indkey, 1) = 1
         "#,
     )

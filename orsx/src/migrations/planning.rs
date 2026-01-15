@@ -227,6 +227,8 @@ pub async fn apply_safe_alters(
                             && e.method == "btree"
                             && e.columns.len() == 1
                             && e.columns[0] == *column
+                            && e.predicate.is_none()
+                            && !e.has_expressions
                     }) {
                         continue;
                     }
@@ -415,7 +417,10 @@ fn index_sort_key(idx: &IndexInfo) -> (u8, &'static str, String) {
 fn has_equivalent_index(existing: &[IndexIdentity], idx: &IndexInfo) -> bool {
     let want_method = idx.index_type.to_sql().to_lowercase();
     existing.iter().any(|e| {
-        e.unique == idx.unique
+        // v1.2 safety: do not treat partial/expression indexes as equivalent to plain column indexes.
+        e.predicate.is_none()
+            && !e.has_expressions
+            && e.unique == idx.unique
             && e.method == want_method
             && e.columns.len() == idx.columns.len()
             && e.columns

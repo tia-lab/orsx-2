@@ -113,6 +113,20 @@ Extend “canonical index identity” to include, as configured:
 - included columns list,
 - operator class/collation (optional, may be deferred).
 
+### 3.2.1 v1.2 safety subset (implemented first)
+
+Before adding any new Rust declaration syntax, ORSX2 must tighten idempotency matching so it does
+not accidentally treat a partial or expression index as equivalent to a plain “index on columns(...)”
+spec request.
+
+Rules:
+
+- A partial index (`WHERE ...`) is never considered equivalent to a non-partial index request.
+- An expression index (`((...))`) is never considered equivalent to a plain column index request.
+
+This may create redundant indexes in rare cases (e.g. predicate is tautological), but it avoids
+silently weakening uniqueness semantics.
+
 ### 3.3 Scope control
 
 This add-on should be gated behind an explicit config flag, because it increases complexity.
@@ -173,6 +187,7 @@ Add an opt-in strict preflight mode for row-wise reads:
 
 - validate `row.columns().len() == schema.len()`,
 - optionally validate returned column names match `ColumnarField.name` when provided,
+- optionally validate that the returned SQL types are compatible with the schema’s decode types,
 - run once, on the first observed row (prevents per-row overhead).
 
 Implementation surface:
@@ -180,6 +195,8 @@ Implementation surface:
 - `RowWiseBatchReaderConfig { validate_column_count: bool, validate_column_names: bool }`
   - default: all `false` (opt-in)
 - `RowWiseBatchReader::with_config(cfg)` to enable.
+- `ColumnarBatchReader` must provide a constructor that can pass a `RowWiseBatchReaderConfig`
+  through when `RowWise` is chosen (including `Auto(...)` choosing row-wise).
 
 Preflight behavior:
 
@@ -190,11 +207,17 @@ Preflight behavior:
   - only fields with `ColumnarField.name = Some(...)` are checked,
   - mismatch returns:
     - `row-wise preflight failed: column name mismatch at index i (expected `x`, got `y`)`
+- If `validate_type_compatible` is enabled:
+  - use `sqlx::Type<Postgres>::compatible(...)` against the returned column type info,
+  - mismatch returns:
+    - `row-wise preflight failed: type mismatch at index i (expected <hint>, got <pg type name>)`
 
 Limitations:
 
 - Empty result sets cannot be preflighted (no first row), so the preflight does not run.
 - Type mismatches are still detected by `try_get` during decoding (not preflighted).
+  - If `validate_type_compatible` is enabled, type mismatches should be rejected earlier, but
+    the final authority remains `try_get` (driver-level decode rules).
 
 ### 5.3 Required tests
 

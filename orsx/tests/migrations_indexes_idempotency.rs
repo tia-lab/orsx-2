@@ -273,3 +273,144 @@ async fn table_name_override_does_not_collide_on_index_names() {
         );
     }
 }
+
+#[tokio::test]
+async fn partial_unique_index_is_not_treated_as_equivalent() {
+    let url = std::env::var("ORSX_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://orsx:orsx@localhost:15432/orsx2_test".to_string());
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let table = format!("orsx2_pux_{}", Uuid::new_v4().simple());
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::query(&format!(
+        "DROP TABLE IF EXISTS {} CASCADE",
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    sqlx::query(&format!(
+        "CREATE TABLE {} (id TEXT PRIMARY KEY, email TEXT NOT NULL)",
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, email) VALUES ('a', 'a@a'), ('b', 'b@b')",
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Create a partial unique index on email. Even if the predicate is effectively "always true",
+    // ORSX must not treat partial indexes as equivalent to a plain unique(email) request.
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} (email) WHERE (id <> '')",
+        orsx::quote_identifier(&format!("manual_uq_partial_{table}")),
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let dummy_v2 = UniqueV2 {
+        id: "x".into(),
+        email: "e".into(),
+    };
+    Migrations::init(&pool, &[(dummy_v2, Some(&table))])
+        .await
+        .unwrap();
+
+    let expected_idx = format!("orsx_uq_{table}_email");
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+          SELECT 1
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public'
+            AND c.relkind = 'i'
+            AND c.relname = $1
+        )
+        "#,
+    )
+    .bind(&expected_idx)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(exists, "expected ORSX index `{expected_idx}` to exist");
+}
+
+#[tokio::test]
+async fn expression_unique_index_is_not_treated_as_equivalent() {
+    let url = std::env::var("ORSX_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://orsx:orsx@localhost:15432/orsx2_test".to_string());
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let table = format!("orsx2_eux_{}", Uuid::new_v4().simple());
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::query(&format!(
+        "DROP TABLE IF EXISTS {} CASCADE",
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    sqlx::query(&format!(
+        "CREATE TABLE {} (id TEXT PRIMARY KEY, email TEXT NOT NULL)",
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, email) VALUES ('a', 'A@A'), ('b', 'B@B')",
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Expression unique index on lower(email) should NOT satisfy plain unique(email).
+    sqlx::query(&format!(
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {} ON {} ((lower(email)))",
+        orsx::quote_identifier(&format!("manual_uq_expr_{table}")),
+        orsx::quote_identifier(&table)
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let dummy_v2 = UniqueV2 {
+        id: "x".into(),
+        email: "e".into(),
+    };
+    Migrations::init(&pool, &[(dummy_v2, Some(&table))])
+        .await
+        .unwrap();
+
+    let expected_idx = format!("orsx_uq_{table}_email");
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+          SELECT 1
+          FROM pg_catalog.pg_class c
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public'
+            AND c.relkind = 'i'
+            AND c.relname = $1
+        )
+        "#,
+    )
+    .bind(&expected_idx)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(exists, "expected ORSX index `{expected_idx}` to exist");
+}

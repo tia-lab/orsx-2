@@ -186,6 +186,10 @@ When applying indexes on existing tables:
 
 This prevents creating duplicates if the database already has the same index under a different name.
 
+Notes:
+
+- Partial indexes (`... WHERE ...`) and expression indexes (`... ((expr)) ...`) are not treated as equivalent to plain column indexes.
+
 Reference tests:
 
 - `orsx/tests/migrations_indexes_idempotency.rs`
@@ -272,6 +276,7 @@ If you use `RowWiseBatchReader` directly, you can opt into a one-time preflight 
 
 - `validate_column_count`: `row.columns().len()` must match `ColumnarSchema::len()`
 - `validate_column_names`: returned column names must match `ColumnarField.name` (when `Some`)
+- `validate_type_compatible`: returned SQL types must be compatible with the schema's decode types (`sqlx::Type<Postgres>::compatible`)
 
 ```rust
 use orsx::columnar::{ColumnarBatch, RowWiseBatchReader, RowWiseBatchReaderConfig};
@@ -285,6 +290,7 @@ let mut reader = RowWiseBatchReader::new_select_unchecked(conn, sql, schema.clon
     .with_config(RowWiseBatchReaderConfig {
         validate_column_count: true,
         validate_column_names: true,
+        validate_type_compatible: true,
     });
 
 let _rows = reader.next_batch_into(&mut batch).await?;
@@ -293,7 +299,11 @@ let _rows = reader.next_batch_into(&mut batch).await?;
 Limitations:
 
 - Empty result sets cannot be preflighted (no first row), so the preflight does not run.
-- Types are not “preflighted”; if the SQL types do not match the schema, `try_get` fails when decoding.
+- Even with `validate_type_compatible`, the final authority remains `try_get` during decoding (driver-level rules).
+
+If you want preflight while using `ColumnarBatchReader` (including `Auto(...)`), use:
+
+- `ColumnarBatchReader::new_select_unchecked_with_row_wise_config(..., Some(row_wise_cfg))`
 
 ### Accessing columns
 

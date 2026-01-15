@@ -75,6 +75,17 @@ For hot paths, the API must follow:
 - reuse buffers deterministically,
 - avoid heap allocations inside the steady-state per-value loops.
 
+### 4.3 Row-wise configuration propagation (required)
+
+When using the wrapper reader (`ColumnarBatchReader`, including `Auto(...)`), callers must be able
+to pass row-wise reader configuration (strict preflight) without constructing `RowWiseBatchReader`
+directly.
+
+Contract:
+
+- wrapper keeps current defaults (no preflight unless explicitly enabled),
+- configuration only affects the row-wise path; COPY BINARY is unchanged.
+
 ## 5) Type mapping contract (mandatory)
 
 ### 5.1 Supported Postgres → columnar mappings (v1)
