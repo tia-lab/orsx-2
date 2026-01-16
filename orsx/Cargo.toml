@@ -1,0 +1,36 @@
+[package]
+name = "orsx"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "orsx2 rewrite in progress: Postgres migrations + compression over sqlx"
+
+[dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+cydec = { workspace = true }
+crc32fast = "1.5"
+jiff = { workspace = true }
+jiff-sqlx = { workspace = true }
+
+orsx-macros = { path = "../orsx-macros" }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "planning"
+harness = false
+
+[[bench]]
+name = "compression"
+harness = false

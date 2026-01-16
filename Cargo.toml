@@ -1,0 +1,42 @@
+[workspace]
+members = ["orsx", "orsx-macros"]
+resolver = "2"
+
+[workspace.dependencies]
+# Core database
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json"] }
+bytes = "1"
+futures-util = "0.3"
+
+# DateTime handling
+jiff = { version = "0.2", features = ["serde"] }
+jiff-sqlx = { version = "0.1", features = ["postgres"] }
+
+# Vector similarity
+pgvector = "0.4"
+
+# Compression
+cydec = "0.0.2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+# Proc macro dependencies
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+# Testing
+async-trait = "0.1"
+criterion = { version = "0.7", features = ["async_tokio"] }
