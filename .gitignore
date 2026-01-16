@@ -1,7 +1,0 @@
-target
-target/
-.env
-protocols*
-AGENTS.md
-deprecated*
-dev*
