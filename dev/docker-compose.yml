@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: orsx2-test-db
+    environment:
+      POSTGRES_USER: orsx
+      POSTGRES_PASSWORD: orsx
+      POSTGRES_DB: orsx2_test
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orsx -d orsx2_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - orsx2_pgdata:/var/lib/postgresql/data
+
+volumes:
+  orsx2_pgdata:
+
