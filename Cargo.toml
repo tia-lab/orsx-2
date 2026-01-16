@@ -40,3 +40,6 @@ proc-macro2 = "1"
 # Testing
 async-trait = "0.1"
 criterion = { version = "0.7", features = ["async_tokio"] }
+
+# Git
+cargo-husky = "1.5.0"

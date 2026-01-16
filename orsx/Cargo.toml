@@ -26,6 +26,7 @@ orsx-macros = { path = "../orsx-macros" }
 uuid = { version = "1", features = ["v4"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 criterion = { workspace = true }
+cargo-husky = { workspace = true, features = ["user-hooks"] }
 
 [[bench]]
 name = "planning"

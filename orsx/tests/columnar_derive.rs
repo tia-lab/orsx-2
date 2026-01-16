@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use orsx::columnar::{ColumnarType, OrsxColumnar};
 
 #[derive(orsx::OrsxColumnar)]
@@ -20,4 +22,3 @@ fn derive_generates_schema() {
     assert_eq!(MyTable::COL_NAME_, 0);
     assert_eq!(MyTable::COL_PWT, 1);
 }
-

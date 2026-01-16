@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use orsx::prelude::*;
 
 #[derive(OrsxMigrate)]
@@ -47,4 +49,3 @@ async fn migrations_create_table_smoke() {
         .unwrap();
     assert_eq!(count.0, 1);
 }
-

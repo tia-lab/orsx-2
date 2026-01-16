@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use orsx::prelude::*;
 use sqlx::Connection;
 use uuid::Uuid;

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use orsx::migrations::config::MigrationConfig;
 use orsx::prelude::*;
 
@@ -78,4 +80,3 @@ async fn online_rewrite_parallel_backfill_bigint_pk_smoke() {
         .unwrap();
     assert_eq!(total.0, 50_000);
 }
-

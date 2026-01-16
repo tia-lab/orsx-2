@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use orsx::migrations::config::MigrationConfig;
 use orsx::prelude::*;
 
@@ -416,4 +418,3 @@ async fn online_rewrite_big_table_bigint_pk() {
             .unwrap();
     assert_eq!(nulls.0, 0);
 }
-

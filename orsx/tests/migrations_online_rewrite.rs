@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use orsx::migrations::config::MigrationConfig;
 use orsx::prelude::*;
 

@@ -608,6 +608,17 @@ This checkout was validated with:
 
 Some large-table tests create the `uuid-ossp` extension (`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`).
 
+## Git hooks (optional)
+
+This repo can use `cargo-husky` to install git hooks from `.cargo-husky/hooks/`.
+
+Current hooks:
+
+- `pre-commit`: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace --lib`
+- `pre-push`: `cargo test --workspace --lib`
+
+To install/update hooks, run a command that builds dev-dependencies at least once (for example: `cargo test -p orsx --lib`).
+
 ## Repo protocols and evidence logs
 
 The rewrite work in this repo tracks decisions and results in `protocols/`:
