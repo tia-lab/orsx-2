@@ -545,9 +545,9 @@ async fn main() -> Result<()> {
 
 ### Columnar retrieval
 
-All of these numbers are from `protocols/orsx2_evidence/columnar_trials.md` and are “release” builds.
+All of these numbers are from `docs/evidence/columnar_trials.md` and are “release” builds.
 
-From `protocols/orsx2_evidence/columnar_trials.md`:
+From `docs/evidence/columnar_trials.md`:
 
 - 2026-01-14 14:40:38Z:
   - 100k × 50 cols: COPY → `ColumnarBatch` `262.405752ms`, row-wise → `ColumnarBatch` `299.598514ms`
@@ -563,9 +563,9 @@ Exact commands used for these trials are recorded in the log entries.
 
 ### Migrations (online rewrite)
 
-All of these numbers are from `protocols/orsx2_evidence/migration_trials.md` and are “release” builds.
+All of these numbers are from `docs/evidence/migration_trials.md` and are “release” builds.
 
-From `protocols/orsx2_evidence/migration_trials.md`:
+From `docs/evidence/migration_trials.md`:
 
 - 2026-01-14T10:48:43Z (UUID PK, 1,000,000 seeded + 100,000 writer inserts):
   - cutover lock: ~`1012ms` (budget `5000ms`)
@@ -618,13 +618,3 @@ Current hooks:
 - `pre-push`: `cargo test --workspace --lib`
 
 To install/update hooks, run a command that builds dev-dependencies at least once (for example: `cargo test -p orsx --lib`).
-
-## Repo protocols and evidence logs
-
-The rewrite work in this repo tracks decisions and results in `protocols/`:
-
-- `protocols/orsx2_rewrite_protocol.md`
-- Specs: `protocols/orsx2_specs/`
-- Append-only evidence logs:
-  - `protocols/orsx2_evidence/migration_trials.md`
-  - `protocols/orsx2_evidence/columnar_trials.md`
