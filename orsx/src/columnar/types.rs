@@ -844,6 +844,11 @@ impl<'c> CopyBinaryBatchReader<'c> {
             let field_count = self.read_i16_be().await?;
             if field_count == -1 {
                 self.done = true;
+                // sqlx requires the COPY OUT stream to be fully consumed to restore the connection
+                // to ReadyForQuery. Exhausting `copy_out` is a no-op on the happy path (it should
+                // already be at EOF once the trailer row is observed), but it is required for
+                // correctness when the caller wants to reuse the connection.
+                self.drain_copy_out_to_eof().await?;
                 break;
             }
             let field_count_usize: usize = field_count
@@ -864,6 +869,18 @@ impl<'c> CopyBinaryBatchReader<'c> {
         }
 
         Ok(out.row_count())
+    }
+
+    async fn drain_copy_out_to_eof(&mut self) -> Result<()> {
+        loop {
+            match self.copy_out.try_next().await {
+                Ok(Some(_chunk)) => {
+                    // Discard; this should normally never yield data after the trailer row.
+                }
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(Error::Database(e)),
+            }
+        }
     }
 
     async fn parse_header(&mut self) -> Result<()> {
