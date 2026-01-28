@@ -1,0 +1,17 @@
+allow-branch = [
+    "main",
+    "!HEAD",
+]
+
+publish = false
+push = true
+push-remote = "origin"
+
+tag = true
+tag-name = "agg-v{{version}}"
+tag-message = "chore: Release {{crate_name}} {{version}}"
+
+pre-release-commit-message = "chore: Release {{crate_name}} {{version}}"
+
+sign-commit = false
+sign-tag = false
