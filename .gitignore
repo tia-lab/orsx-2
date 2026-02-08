@@ -8,3 +8,5 @@ dev*
 bun.lock
 Cargo.lock
 node_modules*
+.serena
+orsx/docs/specs

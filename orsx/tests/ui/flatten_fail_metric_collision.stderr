@@ -1,0 +1,13 @@
+error: OrsxFlatten metric id collision: `ma_a`
+  --> tests/ui/flatten_fail_metric_collision.rs:14:16
+   |
+14 |     pub struct Out {
+   |                ^^^
+
+warning: unused import: `orsx::prelude::*`
+ --> tests/ui/flatten_fail_metric_collision.rs:1:5
+  |
+1 | use orsx::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

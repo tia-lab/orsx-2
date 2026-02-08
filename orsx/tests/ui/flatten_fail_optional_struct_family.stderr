@@ -1,0 +1,13 @@
+error: OrsxFlatten does not support Option<Struct> for family nodes
+  --> tests/ui/flatten_fail_optional_struct_family.rs:16:18
+   |
+16 |         pub fam: Option<Fam>,
+   |                  ^^^^^^^^^^^
+
+warning: unused import: `orsx::prelude::*`
+ --> tests/ui/flatten_fail_optional_struct_family.rs:1:5
+  |
+1 | use orsx::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
