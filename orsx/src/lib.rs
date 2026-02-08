@@ -7,6 +7,7 @@ pub mod types;
 pub mod compression;
 pub mod compressed;
 pub mod columnar;
+pub mod flatten;
 
 pub use error::{Error, Result};
 pub use config::Config;
@@ -20,6 +21,7 @@ pub use columnar::{
     ColumnarSchema, ColumnarType, CopyBinaryBatchReader, RowWiseBatchReader,
     RowWiseBatchReaderConfig,
 };
+pub use flatten::{OrsxValueVisitor, PgArgumentsVisitor};
 
 pub use sqlx;
 pub use jiff::Timestamp;
@@ -31,11 +33,15 @@ pub fn quote_identifier(name: &str) -> String {
 
 pub use orsx_macros::OrsxMigrate;
 pub use orsx_macros::OrsxColumnar;
+pub use orsx_macros::OrsxFlatten;
+pub use orsx_macros::orsx_flatten_module;
 
 pub mod prelude {
     pub use crate::{quote_identifier, ColumnSpec, Config, Error, FieldType, IndexInfo, IndexType};
     pub use crate::{Migrations, OrsxMigrate, Result, TableSpec};
     pub use crate::OrsxColumnar;
+    pub use crate::{OrsxFlatten, orsx_flatten_module};
+    pub use crate::{OrsxValueVisitor, PgArgumentsVisitor};
     pub use crate::{Compressed, CompressedWorkspace};
     pub use crate::{
         ColumnarAutoConfig, ColumnarBatch, ColumnarBatchReader, ColumnarField, ColumnarReaderMode,

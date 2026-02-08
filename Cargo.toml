@@ -2,6 +2,13 @@
 members = ["orsx", "orsx-macros"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["tia-lab"]
+description = "orsx2: Postgres migrations + compression over sqlx"
+license = "MIT OR Apache-2.0"
+
 [workspace.dependencies]
 # Core database
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json"] }

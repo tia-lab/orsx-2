@@ -1,0 +1,13 @@
+error: OrsxFlatten leaf Vec<T> is unsupported unless T=u8; wrap structured payloads as sqlx::types::Json<T> or skip
+ --> tests/ui/flatten_fail_unsupported_leaf_type.rs:8:17
+  |
+8 |         pub xs: Vec<f64>,
+  |                 ^^^^^^^^
+
+warning: unused import: `orsx::prelude::*`
+ --> tests/ui/flatten_fail_unsupported_leaf_type.rs:1:5
+  |
+1 | use orsx::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default

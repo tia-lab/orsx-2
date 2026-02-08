@@ -27,6 +27,9 @@ uuid = { version = "1", features = ["v4"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 criterion = { workspace = true }
 cargo-husky = { workspace = true, features = ["user-hooks"] }
+trybuild = "1.0"
+sha2 = "0.10"
+serde_json = { workspace = true }
 
 [[bench]]
 name = "planning"
@@ -34,4 +37,8 @@ harness = false
 
 [[bench]]
 name = "compression"
+harness = false
+
+[[bench]]
+name = "flatten"
 harness = false

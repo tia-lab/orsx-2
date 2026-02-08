@@ -7,6 +7,7 @@ The current implementation covers:
 1. Schema-driven Postgres migrations (including an online rewrite path for large tables).
 2. Columnar retrieval into `ColumnarBatch` (COPY BINARY and row-wise).
 3. Numeric vector compression stored as `BYTEA` with a small envelope.
+4. Flattened wide schemas for “processor outputs” (recursive flatten inside an inline `mod`, deterministic column ids/order, schema hash, and a deterministic binder/visitor).
 
 This README is intended to describe the repository as it exists right now, including current limitations.
 
@@ -19,7 +20,7 @@ This README is intended to describe the repository as it exists right now, inclu
 ## Crates
 
 - `orsx/`: library (public API)
-- `orsx-macros/`: proc macros (`#[derive(OrsxMigrate)]`, `#[derive(OrsxColumnar)]`)
+- `orsx-macros/`: proc macros (`#[derive(OrsxMigrate)]`, `#[derive(OrsxColumnar)]`, `#[derive(OrsxFlatten)]`, `#[orsx::orsx_flatten_module]`)
 
 ## Quick start
 
@@ -426,6 +427,104 @@ let name_i = std::str::from_utf8(&name_data[start..end]).unwrap();
 
 This is intended for “send batch over the wire / store in cache” use cases.
 
+## 2.5) Flattened wide schemas (`#[orsx::orsx_flatten_module]`)
+
+### What it does
+
+For very wide “processor output” structs (hundreds to thousands of columns), ORSX can generate:
+
+- a Postgres table schema (`OrsxMigrate::spec()`),
+- a columnar schema (`OrsxColumnar::columnar_schema()`),
+- deterministic column ids and ordering (`COLUMNS_IN_ORDER`, `METRIC_COLUMNS_IN_ORDER`),
+- a deterministic schema hash (`SCHEMA_HASH`),
+- a deterministic write-path binder (`visit_values_in_order(...)` + `PgArgumentsVisitor`).
+
+This is intended to avoid hand-writing and maintaining large `INSERT/UPSERT` bind lists.
+
+### Why a module macro?
+
+On stable Rust, proc-macros cannot read the invoking source file via `proc_macro::Span` (that API is unstable), so recursive flattening must work from the tokens the macro receives.
+
+`#[orsx::orsx_flatten_module]` requires an **inline** module body (`mod outputs { ... }`), so it can parse all related structs in that module and recurse without filesystem reads.
+
+For flat structs (no `#[orsx_family]` recursion), `#[derive(OrsxFlatten)]` is available. For recursive flatten, use the module macro.
+
+### Marker attributes inside the module
+
+- Root type:
+  - `#[orsx_processor_id("...")]` (required; also participates in the schema hash)
+- Family fields (nested structs):
+  - `#[orsx_family(prefix = "ma_")]`
+- Leaf fields:
+  - `#[orsx_column(skip)]` to exclude a field from the flattened schema
+  - `#[orsx_column(id = "custom_id")]` to override the generated id for a leaf
+
+The macro consumes these marker attributes and removes them from the emitted items (so downstream code does not need to register them as “known” attributes).
+
+### Deterministic ids and ordering (locked behavior)
+
+- Non-metric (provenance) fields come first, in root declaration order.
+- Flattened metric columns are generated with canonical ids and then sorted lexicographically by id.
+
+This ordering is exposed as:
+
+- `COLUMNS_IN_ORDER` (provenance + metric)
+- `METRIC_COLUMNS_IN_ORDER` (metric only)
+
+### Example
+
+```rust
+use orsx::prelude::*;
+
+#[orsx::orsx_flatten_module]
+mod outputs {
+    #[derive(Clone)]
+    pub struct MovingAverages {
+        pub ema_9: f64,
+        pub ema_21: f64,
+    }
+
+    #[derive(Clone)]
+    pub struct Oscillators {
+        pub rsi_14: f64,
+    }
+
+    #[orsx_processor_id("proc_a")]
+    #[derive(Clone)]
+    pub struct Out {
+        pub pair: String,
+        pub e_ms: i64,
+
+        #[orsx_family(prefix = "ma_")]
+        pub ma: MovingAverages,
+
+        #[orsx_family(prefix = "osc_")]
+        pub osc: Oscillators,
+    }
+}
+```
+
+### Binding to SQLx (`PgArgumentsVisitor`)
+
+The macro also generates:
+
+- `Out::visit_values_in_order(&self, visitor: &mut impl OrsxValueVisitor) -> Result<()>`
+
+ORSX provides a `PgArgumentsVisitor` to bind into `sqlx::postgres::PgArguments`:
+
+```rust
+use orsx::prelude::*;
+use sqlx::postgres::PgArguments;
+
+let out = outputs::Out { /* ... */ };
+
+let mut args = PgArguments::default();
+{
+    let mut v = orsx::PgArgumentsVisitor::new(&mut args);
+    out.visit_values_in_order(&mut v)?;
+}
+```
+
 ## 3) Compressed vectors (`Compressed<T>`)
 
 `Compressed<T>` stores a numeric vector as `BYTEA` with an envelope:
@@ -545,9 +644,9 @@ async fn main() -> Result<()> {
 
 ### Columnar retrieval
 
-All of these numbers are from `docs/evidence/columnar_trials.md` and are “release” builds.
+All of these numbers are from `protocols/orsx2_evidence/columnar_trials.md` and are “release” builds.
 
-From `docs/evidence/columnar_trials.md`:
+From `protocols/orsx2_evidence/columnar_trials.md`:
 
 - 2026-01-14 14:40:38Z:
   - 100k × 50 cols: COPY → `ColumnarBatch` `262.405752ms`, row-wise → `ColumnarBatch` `299.598514ms`
@@ -563,9 +662,9 @@ Exact commands used for these trials are recorded in the log entries.
 
 ### Migrations (online rewrite)
 
-All of these numbers are from `docs/evidence/migration_trials.md` and are “release” builds.
+All of these numbers are from `protocols/orsx2_evidence/migration_trials.md` and are “release” builds.
 
-From `docs/evidence/migration_trials.md`:
+From `protocols/orsx2_evidence/migration_trials.md`:
 
 - 2026-01-14T10:48:43Z (UUID PK, 1,000,000 seeded + 100,000 writer inserts):
   - cutover lock: ~`1012ms` (budget `5000ms`)
@@ -575,6 +674,16 @@ From `docs/evidence/migration_trials.md`:
   - strict migration: ~`7.70s` vs default alter ~`34.8ms`
 
 These are workload- and hardware-dependent; they are meant as evidence of current behavior, not a guarantee.
+
+### Flattened wide schemas (binder/visitor)
+
+Bench results for the generated binder/visitor are recorded in:
+
+- `protocols/orsx2_evidence/bench_results.md`
+
+To run the current microbenchmarks locally:
+
+- `cargo bench -p orsx --bench flatten`
 
 ## Running tests locally
 
@@ -597,16 +706,16 @@ Useful commands:
   - `cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
   - `cargo test -p orsx --test migrations_online_big_uuid --release -- --ignored --nocapture`
 
-### Tests and perf commands run for this README update
+Notes:
 
-This checkout was validated with:
+- Ignored tests are intentionally excluded from the default suite; they are stress/perf workloads and may require a clean test database.
+- Some large-table tests create the `uuid-ossp` extension (`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`).
 
-- `cargo test -p orsx --tests`
-- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
-- `ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
-- `ORSX_COL_ROWS=1000000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+Suggested validation set (choose based on what you changed):
 
-Some large-table tests create the `uuid-ossp` extension (`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`).
+- `cargo test -p orsx --lib`
+- `cargo test -p orsx --tests` (requires Postgres)
+- `cargo bench -p orsx --bench flatten` (optional)
 
 ## Git hooks (optional)
 
