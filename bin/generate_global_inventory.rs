@@ -4,30 +4,13 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const LEGAL_HEADER: &str = r#"```
-MATHILDE PROPRIETARY AND CONFIDENTIAL
-Copyright (c) 2024 MATHILDE. All Rights Reserved.
-
-This document contains trade secrets and confidential information owned
-exclusively by MATHILDE, protected under Swiss law (URG, UWG, Art. 162 StGB).
-
-PROHIBITED: Reproduction, copying, distribution, disclosure, or derivative
-works without prior written authorization from MATHILDE.
-
-ACCESS REQUIREMENT: Executed NDA with MATHILDE required. Unauthorized access
-or possession violates Swiss law. Violations subject to civil remedies,
-injunctive relief, damages, and criminal prosecution.
-
-Legal Contact: massimo.nicora@wnlegal.ch
-```
-"#;
-
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ModuleArtifacts {
     inventory_md: String,
     scope_md: Option<String>,
     spec_mds: Vec<String>,
+    evidence_logs: Vec<String>,
     bench_logs: Vec<String>,
     math_reviews: Vec<String>,
     tests_dir: Option<String>,
@@ -91,6 +74,53 @@ struct ComponentInventory {
 
 fn discover_component_inventories(repo_root: &Path) -> Result<Vec<ComponentInventory>, String> {
     let mut out: Vec<ComponentInventory> = Vec::new();
+    // Primary discovery: workspace-style crates at repo root, e.g. `orsx/`, `orsx-macros/`.
+    for entry in fs::read_dir(repo_root).map_err(|e| format!("read_dir failed: {e}"))? {
+        let entry = entry.map_err(|e| format!("read_dir entry failed: {e}"))?;
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .unwrap_or_else(|| OsStr::new(""))
+            .to_string_lossy()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // Skip known non-crate roots.
+        if matches!(
+            name.as_str(),
+            ".git"
+                | ".cargo"
+                | ".serena"
+                | ".husky"
+                | "target"
+                | "node_modules"
+                | "protocols"
+                | "bin"
+                | "dev"
+                | "deprecated"
+        ) {
+            continue;
+        }
+        let manifest = p.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let inv = p.join("docs").join("inventory.md");
+        if inv.is_file() {
+            out.push(ComponentInventory {
+                kind: ComponentKind::Crate,
+                name,
+                inventory_path: inv,
+                source_root: p,
+            });
+        }
+    }
+
+    // Compatibility discovery: mono-repos that keep components under `crates/*` and `services/*`.
     let pairs = [
         (ComponentKind::Crate, repo_root.join("crates")),
         (ComponentKind::Service, repo_root.join("services")),
@@ -124,8 +154,7 @@ fn discover_component_inventories(repo_root: &Path) -> Result<Vec<ComponentInven
                 continue;
             }
 
-            // TA-style module inventories: `crates/<crate>/src/<module>/docs/inventory.md`.
-            // Only used when the component does not have a top-level `docs/inventory.md`.
+            // Optional module inventories: `<component>/src/<module>/docs/inventory.md`.
             if kind == ComponentKind::Crate {
                 let modules_base = p.join("src");
                 if modules_base.is_dir() {
@@ -160,6 +189,7 @@ fn discover_component_inventories(repo_root: &Path) -> Result<Vec<ComponentInven
             }
         }
     }
+
     out.sort_by(|a, b| (a.kind as u8, &a.name).cmp(&(b.kind as u8, &b.name)));
     Ok(out)
 }
@@ -210,6 +240,21 @@ fn collect_artifacts(
         }
     }
     spec_mds.sort();
+
+    let mut evidence_logs: Vec<String> = Vec::new();
+    let evidence_dir = docs_dir.join("evidence");
+    if evidence_dir.is_dir() {
+        for entry in
+            fs::read_dir(&evidence_dir).map_err(|e| format!("read_dir evidence failed: {e}"))?
+        {
+            let entry = entry.map_err(|e| format!("read_dir evidence entry failed: {e}"))?;
+            let p = entry.path();
+            if p.is_file() && p.extension() == Some(OsStr::new("md")) {
+                evidence_logs.push(rel_path(repo_root, &p)?);
+            }
+        }
+    }
+    evidence_logs.sort();
 
     let mut bench_logs: Vec<String> = Vec::new();
     if docs_dir.is_dir() {
@@ -276,6 +321,7 @@ fn collect_artifacts(
         inventory_md,
         scope_md,
         spec_mds,
+        evidence_logs,
         bench_logs,
         math_reviews,
         tests_dir,
@@ -285,9 +331,13 @@ fn collect_artifacts(
 
 fn parse_inventory_source_file_purposes(inventory_text: &str) -> HashMap<String, String> {
     // Accept only explicit file-purpose lines:
-    // - `crates/<name>/.../*.rs`: purpose...
-    // - `services/<name>/.../*.rs`: purpose...
-    // - `src/<module>/.../*.rs`: purpose... (crate-local; rebased by caller)
+    // - `src/.../*.rs`: purpose... (crate-local; rebased by caller)
+    // - `tests/.../*.rs`: purpose... (crate-local; rebased by caller)
+    // - `benches/.../*.rs`: purpose... (crate-local; rebased by caller)
+    // - `examples/.../*.rs`: purpose... (crate-local; rebased by caller)
+    // - `bin/.../*.rs`: purpose... (crate-local; rebased by caller)
+    // - `crates/<name>/.../*.rs`: purpose... (repo-relative; kept as-is)
+    // - `services/<name>/.../*.rs`: purpose... (repo-relative; kept as-is)
     let mut map = HashMap::new();
     for raw_line in inventory_text.lines() {
         let line = raw_line.trim_start();
@@ -302,7 +352,21 @@ fn parse_inventory_source_file_purposes(inventory_text: &str) -> HashMap<String,
         if !path.ends_with(".rs") {
             continue;
         }
-        if !(path.starts_with("crates/") || path.starts_with("services/") || path.starts_with("src/")) {
+        if path.starts_with('/')
+            || path.starts_with("../")
+            || path.contains("/../")
+            || path.contains('\\')
+        {
+            continue;
+        }
+        if !(path.starts_with("crates/")
+            || path.starts_with("services/")
+            || path.starts_with("src/")
+            || path.starts_with("tests/")
+            || path.starts_with("benches/")
+            || path.starts_with("examples/")
+            || path.starts_with("bin/"))
+        {
             continue;
         }
         let after = rest[end_tick + 1..].trim_start();
@@ -470,21 +534,19 @@ fn main() -> Result<(), String> {
     let mut any_gap = false;
 
     let mut lines: Vec<String> = vec![];
-    lines.push(LEGAL_HEADER.trim_end_matches('\n').to_string());
-    lines.push("".to_string());
     lines.push(format!(
         "# `{repo_name}` — Global Inventory (GENERATED; DO NOT EDIT)"
     ));
     lines.push("".to_string());
     lines.push(format!("Generated: {now}"));
-    lines.push("Protocol: `.dev/examples/inventory_template.md`".to_string());
+    lines.push("Protocol: `protocols/inventory_template.md`".to_string());
     lines.push("".to_string());
     lines.push(
-        "This file is generated from per-component inventories under `crates/*/docs/inventory.md` and `services/*/docs/inventory.md`."
+        "This file is generated from per-component inventories under `*/docs/inventory.md` (workspace crates) and optionally `crates/*/docs/inventory.md` / `services/*/docs/inventory.md`."
             .to_string(),
     );
     lines.push(
-        "If a crate does not have a top-level `docs/inventory.md`, this generator will also include module inventories under `crates/*/src/*/docs/inventory.md`."
+        "If a component does not have a top-level `docs/inventory.md`, this generator may also include module inventories under `<component>/src/*/docs/inventory.md` when present."
             .to_string(),
     );
     lines.push(
@@ -521,6 +583,9 @@ fn main() -> Result<(), String> {
         for s in &artifacts.spec_mds {
             validate_exists(&repo_root, s)?;
         }
+        for e in &artifacts.evidence_logs {
+            validate_exists(&repo_root, e)?;
+        }
         for r in &artifacts.math_reviews {
             validate_exists(&repo_root, r)?;
         }
@@ -538,17 +603,28 @@ fn main() -> Result<(), String> {
             .map_err(|e| format!("read inventory failed: {:?}: {e}", inv.inventory_path))?;
         let raw_purposes = parse_inventory_source_file_purposes(&inv_text);
         let mut purposes: HashMap<String, String> = HashMap::new();
-        let needs_crate_rebase = raw_purposes.keys().any(|p| p.starts_with("src/"));
+        let needs_crate_rebase = raw_purposes.keys().any(|p| {
+            p.starts_with("src/")
+                || p.starts_with("tests/")
+                || p.starts_with("benches/")
+                || p.starts_with("examples/")
+                || p.starts_with("bin/")
+        });
         let crate_root = if needs_crate_rebase {
             Some(find_crate_root(component_root)?)
         } else {
             None
         };
         for (path, purpose) in raw_purposes {
-            let key = if path.starts_with("src/") {
+            let key = if path.starts_with("src/")
+                || path.starts_with("tests/")
+                || path.starts_with("benches/")
+                || path.starts_with("examples/")
+                || path.starts_with("bin/")
+            {
                 let Some(crate_root) = &crate_root else {
                     return Err(format!(
-                        "inventory uses `src/...` paths but crate root could not be determined: {}",
+                        "inventory uses crate-local paths but crate root could not be determined: {}",
                         inv.inventory_path.display()
                     ));
                 };
@@ -561,11 +637,7 @@ fn main() -> Result<(), String> {
         }
         let component_files = component_source_files(&repo_root, component_root)?;
 
-        let name = match inv.kind {
-            ComponentKind::Crate => format!("crates/{}", inv.name),
-            ComponentKind::Service => format!("services/{}", inv.name),
-            ComponentKind::Module => format!("crates/{}/src/{}", inv.name.split("::").next().unwrap_or(""), inv.name.split("::").nth(1).unwrap_or("")),
-        };
+        let name = rel_path(&repo_root, component_root)?;
 
         lines.push(format!("## `{name}`"));
         lines.push("".to_string());
@@ -577,6 +649,9 @@ fn main() -> Result<(), String> {
         }
         for s in &artifacts.spec_mds {
             lines.push(format!("- Spec: `{s}`"));
+        }
+        for e in &artifacts.evidence_logs {
+            lines.push(format!("- Evidence: `{e}`"));
         }
         for r in &artifacts.math_reviews {
             lines.push(format!("- Math review: `{r}`"));

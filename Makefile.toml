@@ -44,3 +44,17 @@ args = ["release", "major", "-x", "--no-confirm"]
 description = "Execute explicit-version release (set VERSION=...); example: cargo make rl set VERSION=0.2.0"
 command = "cargo"
 args = ["release", "${VERSION}", "-x", "--no-confirm"]
+
+[tasks.inventory]
+description = "Generate the repo root inventory.md from per-component inventories."
+script_runner = "@shell"
+script = [
+  "set -eu",
+  "test -f Cargo.toml || { echo \"run from repo root\"; exit 1; }",
+  "command -v rustc >/dev/null 2>&1 || { echo \"rustc not found\"; exit 1; }",
+  "mkdir -p target/tools",
+  "bin_out=\"target/tools/generate_global_inventory\"",
+  "rustc -O bin/generate_global_inventory.rs -o \"$bin_out\"",
+  "\"$bin_out\" --repo-root \"$(pwd)\" --out \"$(pwd)/inventory.md\" --strict",
+  "echo \"ok: wrote inventory.md\"",
+]
