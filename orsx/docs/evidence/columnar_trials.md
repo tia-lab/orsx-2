@@ -241,3 +241,36 @@ Results:
 
 Notes:
 - Add-ons in this sprint (row-wise preflight, partial/expression index equivalence safety, JSONB columnar type) do not materially affect this specific perf trial’s query shape (no JSONB column).
+
+### 2026-02-14 12:47:41Z — Release rerun (orsx2_test only)
+
+Safety:
+- Production DB on `localhost:1364` was NOT accessed.
+- All operations ran against `postgresql://orsx:orsx@localhost:15432/orsx2_test` only (test DB).
+
+Machine:
+- CPU: Intel(R) Xeon(R) W-2295 CPU @ 3.00GHz (36 vCPU / 18 cores)
+- OS: Linux 5.15.0-156-generic x86_64 GNU/Linux
+
+Postgres:
+- Client version: `psql (PostgreSQL) 14.20 (Ubuntu 14.20-0ubuntu0.22.04.1)`
+- Server version: `PostgreSQL 16.11 (Debian 16.11-1.pgdg13+1)`
+
+Command:
+- `ORSX_TEST_DATABASE_URL=postgresql://orsx:orsx@localhost:15432/orsx2_test ORSX_COL_ROWS=100000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_TEST_DATABASE_URL=postgresql://orsx:orsx@localhost:15432/orsx2_test ORSX_COL_ROWS=100000 ORSX_COL_COLS=500 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+- `ORSX_TEST_DATABASE_URL=postgresql://orsx:orsx@localhost:15432/orsx2_test ORSX_COL_ROWS=1000000 ORSX_COL_COLS=50 cargo test -p orsx --test columnar_perf_trials --release -- --ignored --nocapture`
+
+Results:
+- 100k × 50 cols:
+  - COPY → `ColumnarBatch`: `278.194645ms`
+  - Row-wise → `ColumnarBatch`: `250.520576ms`
+- 100k × 500 cols:
+  - COPY → `ColumnarBatch`: `2.570286511s`
+  - Row-wise → `ColumnarBatch`: `2.82776936s`
+- 1M × 50 cols:
+  - COPY → `ColumnarBatch`: `3.049796336s`
+  - Row-wise → `ColumnarBatch`: `2.631520764s`
+
+Notes:
+- Wide tables still favor COPY; narrow tables can favor row-wise.

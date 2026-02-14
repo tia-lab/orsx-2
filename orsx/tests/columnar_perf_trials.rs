@@ -142,6 +142,11 @@ async fn columnar_perf_trial_copy_binary_vs_row_wise() {
         {
             let col_idx = fcols + 2;
             let (_offsets, chunks, _total) = batch.var_chunks(col_idx).unwrap();
+            if let Some(inline) = batch.var_inline_bytes(col_idx) {
+                for &x in inline {
+                    col_sum_bytes = col_sum_bytes.wrapping_add(x as u64);
+                }
+            }
             for c in chunks {
                 for &x in c.as_ref() {
                     col_sum_bytes = col_sum_bytes.wrapping_add(x as u64);

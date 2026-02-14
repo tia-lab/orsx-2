@@ -126,6 +126,17 @@ impl ValidityBitmap {
         Ok(())
     }
 
+    #[inline]
+    fn clear(&mut self, row_idx: usize) -> Result<()> {
+        let byte_idx = row_idx / 8;
+        let bit_idx = row_idx % 8;
+        if byte_idx >= self.bytes.len() {
+            return Err(Error::Other("validity bitmap out of bounds".to_string()));
+        }
+        self.bytes[byte_idx] &= !(1u8 << bit_idx);
+        Ok(())
+    }
+
     fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -834,6 +845,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
         }
 
         out.prepare(out.row_capacity())?;
+        self.init_out_validity_all_valid(out)?;
 
         if !self.header_parsed {
             self.parse_header().await?;
@@ -841,7 +853,10 @@ impl<'c> CopyBinaryBatchReader<'c> {
         }
 
         while out.row_count() < out.row_capacity() {
-            let field_count = self.read_i16_be().await?;
+            if self.buf.len().saturating_sub(self.pos) < 2 {
+                self.ensure_available(2).await?;
+            }
+            let field_count = self.read_i16_be_sync()?;
             if field_count == -1 {
                 self.done = true;
                 // sqlx requires the COPY OUT stream to be fully consumed to restore the connection
@@ -862,13 +877,65 @@ impl<'c> CopyBinaryBatchReader<'c> {
             }
 
             let row_idx = out.row_count();
-            for col_idx in 0..field_count_usize {
-                self.read_field_into(out, row_idx, col_idx).await?;
+            for col in out.columns.iter_mut() {
+                self.read_field_into_col(col, row_idx).await?;
             }
             out.finish_row()?;
         }
 
+        self.mask_out_validity_unused_bits(out)?;
         Ok(out.row_count())
+    }
+
+    fn init_out_validity_all_valid(&self, out: &mut ColumnarBatch) -> Result<()> {
+        for col in &mut out.columns {
+            match col {
+                ColumnData::Var { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedBool { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedI16 { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedI32 { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedI64 { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedF32Bits { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedF64Bits { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedUuid { validity, .. } => validity.bytes.fill(0xFF),
+                ColumnData::FixedTimestampMicros { validity, .. } => validity.bytes.fill(0xFF),
+            }
+        }
+        Ok(())
+    }
+
+    fn mask_out_validity_unused_bits(&self, out: &mut ColumnarBatch) -> Result<()> {
+        let row_count = out.row_count;
+        let needed = row_count
+            .checked_add(7)
+            .ok_or_else(|| Error::Other("row count overflow".to_string()))?
+            / 8;
+        if needed == 0 {
+            return Ok(());
+        }
+        let rem = row_count % 8;
+        if rem == 0 {
+            return Ok(());
+        }
+        let mask = (1u8 << rem) - 1;
+        for col in &mut out.columns {
+            let bytes: &mut [u8] = match col {
+                ColumnData::Var { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedBool { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedI16 { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedI32 { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedI64 { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedF32Bits { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedF64Bits { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedUuid { validity, .. } => validity.bytes.as_mut_slice(),
+                ColumnData::FixedTimestampMicros { validity, .. } => validity.bytes.as_mut_slice(),
+            };
+            if bytes.len() < needed {
+                return Err(Error::Other("validity bitmap out of bounds".to_string()));
+            }
+            bytes[needed - 1] &= mask;
+        }
+        Ok(())
     }
 
     async fn drain_copy_out_to_eof(&mut self) -> Result<()> {
@@ -912,51 +979,156 @@ impl<'c> CopyBinaryBatchReader<'c> {
         Ok(())
     }
 
-    async fn read_u8(&mut self) -> Result<u8> {
-        self.ensure_available(1).await?;
-        let b = self
-            .buf
-            .get(self.pos)
-            .copied()
-            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
-        self.pos = self
-            .pos
-            .checked_add(1)
+    #[inline]
+    fn take_bytes_sync(&mut self, n: usize) -> Result<&[u8]> {
+        let start = self.pos;
+        let end = start
+            .checked_add(n)
             .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-        Ok(b)
+        if end > self.buf.len() {
+            return Err(Error::Other("unexpected end of COPY stream".to_string()));
+        }
+        self.pos = end;
+        // Safe because `end <= buf.len()` is checked above.
+        Ok(unsafe { self.buf.get_unchecked(start..end) })
     }
 
-    async fn read_field_into(
-        &mut self,
-        out: &mut ColumnarBatch,
-        row_idx: usize,
-        col_idx: usize,
-    ) -> Result<()> {
-        let len = self.read_i32_be().await?;
+    #[inline]
+    fn read_u8_sync(&mut self) -> Result<u8> {
+        Ok(self.take_bytes_sync(1)?[0])
+    }
+
+    #[inline]
+    fn read_i16_be_sync(&mut self) -> Result<i16> {
+        let start = self.pos;
+        let end = start
+            .checked_add(2)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        if end > self.buf.len() {
+            return Err(Error::Other("unexpected end of COPY stream".to_string()));
+        }
+        let ptr = unsafe { self.buf.as_ptr().add(start) as *const i16 };
+        // Safety: bounds checked above; `read_unaligned` is valid for any alignment.
+        let x = unsafe { ptr.read_unaligned() };
+        self.pos = end;
+        Ok(i16::from_be(x))
+    }
+
+    #[inline]
+    fn read_i32_be_sync(&mut self) -> Result<i32> {
+        let start = self.pos;
+        let end = start
+            .checked_add(4)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        if end > self.buf.len() {
+            return Err(Error::Other("unexpected end of COPY stream".to_string()));
+        }
+        let ptr = unsafe { self.buf.as_ptr().add(start) as *const i32 };
+        // Safety: bounds checked above; `read_unaligned` is valid for any alignment.
+        let x = unsafe { ptr.read_unaligned() };
+        self.pos = end;
+        Ok(i32::from_be(x))
+    }
+
+    #[inline]
+    fn read_i64_be_sync(&mut self) -> Result<i64> {
+        let start = self.pos;
+        let end = start
+            .checked_add(8)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        if end > self.buf.len() {
+            return Err(Error::Other("unexpected end of COPY stream".to_string()));
+        }
+        let ptr = unsafe { self.buf.as_ptr().add(start) as *const i64 };
+        // Safety: bounds checked above; `read_unaligned` is valid for any alignment.
+        let x = unsafe { ptr.read_unaligned() };
+        self.pos = end;
+        Ok(i64::from_be(x))
+    }
+
+    #[inline]
+    fn read_u32_be_sync(&mut self) -> Result<u32> {
+        let start = self.pos;
+        let end = start
+            .checked_add(4)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        if end > self.buf.len() {
+            return Err(Error::Other("unexpected end of COPY stream".to_string()));
+        }
+        let ptr = unsafe { self.buf.as_ptr().add(start) as *const u32 };
+        // Safety: bounds checked above; `read_unaligned` is valid for any alignment.
+        let x = unsafe { ptr.read_unaligned() };
+        self.pos = end;
+        Ok(u32::from_be(x))
+    }
+
+    #[inline]
+    fn read_u64_be_sync(&mut self) -> Result<u64> {
+        let start = self.pos;
+        let end = start
+            .checked_add(8)
+            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
+        if end > self.buf.len() {
+            return Err(Error::Other("unexpected end of COPY stream".to_string()));
+        }
+        let ptr = unsafe { self.buf.as_ptr().add(start) as *const u64 };
+        // Safety: bounds checked above; `read_unaligned` is valid for any alignment.
+        let x = unsafe { ptr.read_unaligned() };
+        self.pos = end;
+        Ok(u64::from_be(x))
+    }
+
+    async fn read_field_into_col(&mut self, col: &mut ColumnData, row_idx: usize) -> Result<()> {
+        if self.buf.len().saturating_sub(self.pos) < 4 {
+            self.ensure_available(4).await?;
+        }
+        let len = self.read_i32_be_sync()?;
         let is_null = len == -1;
         if len < -1 {
             return Err(Error::Other("invalid COPY field length".to_string()));
         }
 
-        let col = out
-            .columns
-            .get_mut(col_idx)
-            .ok_or_else(|| Error::Other("column index out of bounds".to_string()))?;
-
         if is_null {
-            col.set_validity(row_idx, false)?;
             match col {
-                ColumnData::FixedBool { values, .. } => values.push(0),
-                ColumnData::FixedI16 { values, .. } => values.push(0),
-                ColumnData::FixedI32 { values, .. } => values.push(0),
-                ColumnData::FixedI64 { values, .. } => values.push(0),
-                ColumnData::FixedF32Bits { values, .. } => values.push(0),
-                ColumnData::FixedF64Bits { values, .. } => values.push(0),
-                ColumnData::FixedUuid { values, .. } => values.push([0u8; 16]),
-                ColumnData::FixedTimestampMicros { values, .. } => values.push(0),
+                ColumnData::FixedBool { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
+                ColumnData::FixedI16 { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
+                ColumnData::FixedI32 { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
+                ColumnData::FixedI64 { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
+                ColumnData::FixedF32Bits { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
+                ColumnData::FixedF64Bits { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
+                ColumnData::FixedUuid { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push([0u8; 16]);
+                }
+                ColumnData::FixedTimestampMicros { validity, values } => {
+                    validity.clear(row_idx)?;
+                    values.push(0);
+                }
                 ColumnData::Var {
-                    offsets, total_len, ..
+                    validity,
+                    offsets,
+                    total_len,
+                    ..
                 } => {
+                    validity.clear(row_idx)?;
                     offsets.push(*total_len);
                 }
             }
@@ -970,51 +1142,54 @@ impl<'c> CopyBinaryBatchReader<'c> {
             return Err(Error::Other("COPY field too large".to_string()));
         }
 
-        col.set_validity(row_idx, true)?;
+        if self.buf.len().saturating_sub(self.pos) < len_usize {
+            self.ensure_available(len_usize).await?;
+        }
+
         match col {
             ColumnData::FixedBool { values, .. } => {
                 if len_usize != 1 {
                     return Err(Error::Other("COPY field length mismatch for Bool".to_string()));
                 }
-                let b = self.read_u8().await?;
-                values.push(b);
+                values.push(self.read_u8_sync()?);
             }
             ColumnData::FixedI16 { values, .. } => {
                 if len_usize != 2 {
                     return Err(Error::Other("COPY field length mismatch for I16".to_string()));
                 }
-                values.push(self.read_i16_be().await?);
+                values.push(self.read_i16_be_sync()?);
             }
             ColumnData::FixedI32 { values, .. } => {
                 if len_usize != 4 {
                     return Err(Error::Other("COPY field length mismatch for I32".to_string()));
                 }
-                values.push(self.read_i32_be().await?);
+                values.push(self.read_i32_be_sync()?);
             }
             ColumnData::FixedI64 { values, .. } => {
                 if len_usize != 8 {
                     return Err(Error::Other("COPY field length mismatch for I64".to_string()));
                 }
-                values.push(self.read_i64_be().await?);
+                values.push(self.read_i64_be_sync()?);
             }
             ColumnData::FixedF32Bits { values, .. } => {
                 if len_usize != 4 {
                     return Err(Error::Other("COPY field length mismatch for F32".to_string()));
                 }
-                values.push(self.read_u32_be().await?);
+                values.push(self.read_u32_be_sync()?);
             }
             ColumnData::FixedF64Bits { values, .. } => {
                 if len_usize != 8 {
                     return Err(Error::Other("COPY field length mismatch for F64".to_string()));
                 }
-                values.push(self.read_u64_be().await?);
+                values.push(self.read_u64_be_sync()?);
             }
             ColumnData::FixedUuid { values, .. } => {
                 if len_usize != 16 {
                     return Err(Error::Other("COPY field length mismatch for UUID".to_string()));
                 }
+                let bytes = self.take_bytes_sync(16)?;
                 let mut v = [0u8; 16];
-                self.read_exact_into(&mut v).await?;
+                v.copy_from_slice(bytes);
                 values.push(v);
             }
             ColumnData::FixedTimestampMicros { values, .. } => {
@@ -1023,7 +1198,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
                         "COPY field length mismatch for TimestampTz".to_string(),
                     ));
                 }
-                let pg_micros = self.read_i64_be().await?;
+                let pg_micros = self.read_i64_be_sync()?;
                 if pg_micros == i64::MIN || pg_micros == i64::MAX {
                     return Err(Error::Other(
                         "timestamptz infinity is not supported".to_string(),
@@ -1043,16 +1218,7 @@ impl<'c> CopyBinaryBatchReader<'c> {
                 ..
             } => {
                 let validate_utf8 = self.read_cfg.validate_utf8;
-                self.ensure_available(len_usize).await?;
-                let start = self.pos;
-                let end = start
-                    .checked_add(len_usize)
-                    .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-                let bytes = self
-                    .buf
-                    .get(start..end)
-                    .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
-                self.pos = end;
+                let bytes = self.take_bytes_sync(len_usize)?;
                 match ty {
                     ColumnarType::Utf8 => {
                         if validate_utf8 && std::str::from_utf8(bytes).is_err() {
@@ -1121,6 +1287,10 @@ impl<'c> CopyBinaryBatchReader<'c> {
             return Ok(());
         }
 
+        if self.buf.len().saturating_sub(self.pos) >= needed {
+            return Ok(());
+        }
+
         self.compact_if_needed();
 
         while self.buf.len().saturating_sub(self.pos) < needed {
@@ -1150,20 +1320,6 @@ impl<'c> CopyBinaryBatchReader<'c> {
         Ok(())
     }
 
-    async fn read_i16_be(&mut self) -> Result<i16> {
-        self.ensure_available(2).await?;
-        let start = self.pos;
-        let end = start
-            .checked_add(2)
-            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-        let s = self
-            .buf
-            .get(start..end)
-            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
-        self.pos = end;
-        Ok(i16::from_be_bytes([s[0], s[1]]))
-    }
-
     async fn read_i32_be(&mut self) -> Result<i32> {
         self.ensure_available(4).await?;
         let start = self.pos;
@@ -1176,52 +1332,6 @@ impl<'c> CopyBinaryBatchReader<'c> {
             .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
         self.pos = end;
         Ok(i32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    async fn read_i64_be(&mut self) -> Result<i64> {
-        self.ensure_available(8).await?;
-        let start = self.pos;
-        let end = start
-            .checked_add(8)
-            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-        let s = self
-            .buf
-            .get(start..end)
-            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
-        self.pos = end;
-        Ok(i64::from_be_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
-    }
-
-    async fn read_u32_be(&mut self) -> Result<u32> {
-        self.ensure_available(4).await?;
-        let start = self.pos;
-        let end = start
-            .checked_add(4)
-            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-        let s = self
-            .buf
-            .get(start..end)
-            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
-        self.pos = end;
-        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    async fn read_u64_be(&mut self) -> Result<u64> {
-        self.ensure_available(8).await?;
-        let start = self.pos;
-        let end = start
-            .checked_add(8)
-            .ok_or_else(|| Error::Other("buffer index overflow".to_string()))?;
-        let s = self
-            .buf
-            .get(start..end)
-            .ok_or_else(|| Error::Other("unexpected end of COPY stream".to_string()))?;
-        self.pos = end;
-        Ok(u64::from_be_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
     }
 
     async fn read_exact_into(&mut self, out: &mut [u8]) -> Result<()> {
